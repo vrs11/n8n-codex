@@ -1813,129 +1813,6 @@ function sanitizeToolJsonSchema(rawSchema: unknown): Record<string, unknown> {
 	};
 }
 
-function normalizeCodexFunctionTool(
-	container: Record<string, unknown>,
-	functionNode: Record<string, unknown>,
-	usedNames: Set<string>,
-): string | undefined {
-	const functionName = toTrimmed(functionNode.name);
-	if (!functionName) return undefined;
-
-	const preservedName = registerToolName(functionName, usedNames);
-	if (!preservedName) return undefined;
-	functionNode.name = preservedName;
-	functionNode.parameters = sanitizeToolJsonSchema(functionNode.parameters);
-	functionNode.strict = false;
-
-	if (toTrimmed(container.type) === 'function') {
-		container.name = preservedName;
-		container.parameters = sanitizeToolJsonSchema(
-			container.parameters ?? functionNode.parameters,
-		);
-		container.strict = false;
-	}
-
-	return preservedName;
-}
-
-function registerToolName(name: string, usedNames: Set<string>): string | undefined {
-	if (usedNames.has(name)) {
-		return undefined;
-	}
-	usedNames.add(name);
-	return name;
-}
-
-function normalizeToolsForCodex(tools: unknown[]): string[] {
-	const toolNames: string[] = [];
-	const usedNames = new Set<string>();
-
-	for (const tool of tools) {
-		const toolObj = toObject(tool);
-		if (!toolObj) continue;
-
-		const functionObj = toObject(toolObj.function);
-		if (functionObj) {
-			const normalizedName = normalizeCodexFunctionTool(toolObj, functionObj, usedNames);
-			if (normalizedName) {
-				toolNames.push(normalizedName);
-			}
-			continue;
-		}
-
-		if (toTrimmed(toolObj.type) === 'function') {
-			const topLevelName = toTrimmed(toolObj.name);
-			if (!topLevelName) continue;
-			const preservedName = registerToolName(topLevelName, usedNames);
-			if (!preservedName) continue;
-			toolObj.name = preservedName;
-			toolObj.parameters = sanitizeToolJsonSchema(toolObj.parameters);
-			toolObj.strict = false;
-			toolNames.push(preservedName);
-			continue;
-		}
-
-		const directName = toTrimmed(toolObj.name);
-		if (directName) {
-			const preservedName = registerToolName(directName, usedNames);
-			if (!preservedName) continue;
-			toolObj.name = preservedName;
-			toolNames.push(preservedName);
-			continue;
-		}
-	}
-
-	return toolNames;
-}
-
-function normalizeBoundModelTools(model: unknown, debugState: BoundToolsDebugState): void {
-	const modelObj = toObject(model);
-	if (!modelObj) return;
-
-	const defaultOptions = toObject(modelObj.defaultOptions);
-	if (defaultOptions && Array.isArray(defaultOptions.tools)) {
-		debugState.toolNames = normalizeToolsForCodex(defaultOptions.tools);
-		defaultOptions.strict = false;
-		modelObj.defaultOptions = defaultOptions;
-	}
-
-	const kwargs = toObject(modelObj.kwargs);
-	if (kwargs && Array.isArray(kwargs.tools)) {
-		debugState.toolNames = normalizeToolsForCodex(kwargs.tools);
-		kwargs.strict = false;
-		modelObj.kwargs = kwargs;
-	}
-}
-
-function asCodexFunctionTool(
-	tool: unknown,
-	usedNames: Set<string>,
-): Record<string, unknown> | undefined {
-	const toolObj = toObject(tool);
-	if (!toolObj) return undefined;
-
-	const functionObj = toObject(toolObj.function);
-
-	const source = functionObj ?? toolObj;
-	const rawName = toTrimmed(source.name) ?? toTrimmed(toolObj.name);
-	if (!rawName) return undefined;
-
-	const name = registerToolName(rawName, usedNames);
-	if (!name) return undefined;
-	const description =
-		toTrimmed(source.description) ?? toTrimmed(toolObj.description) ?? 'No description';
-	const parameters = sanitizeToolJsonSchema(source.parameters ?? toolObj.parameters);
-
-	// Codex CLI emits top-level function tools for responses API.
-	return {
-		type: 'function',
-		name,
-		description,
-		strict: false,
-		parameters,
-	};
-}
-
 function supportsParallelToolCalls(modelName: string | undefined): boolean {
 	if (!ALLOW_PARALLEL_TOOL_CALLS) {
 		// Default to serial tool calls because chatgpt codex backend often rejects
@@ -1959,232 +1836,6 @@ function normalizeModelName(modelName: string | undefined): string | undefined {
 	const normalized = modelName?.trim().toLowerCase();
 	return normalized || undefined;
 }
-
-function ensureCodexInputForTools(input: unknown, hasTools: boolean): unknown {
-	if (!hasTools) return input;
-	if (Array.isArray(input)) return input;
-
-	if (typeof input === 'string') {
-		const text = input.trim();
-		if (!text) return [];
-		return [
-			{
-				type: 'message',
-				role: 'user',
-				content: text,
-			},
-		];
-	}
-
-	const inputObj = toObject(input);
-	if (inputObj) return [inputObj];
-	return [];
-}
-
-function stringifyCodexJson(value: unknown, fallback: string): string {
-	if (typeof value === 'string') return value;
-	try {
-		return JSON.stringify(value ?? fallback);
-	} catch {
-		return fallback;
-	}
-}
-
-function normalizeCodexMessageContent(content: unknown): string | undefined {
-	if (typeof content === 'string') return content;
-
-	if (Array.isArray(content)) {
-		const textParts = content
-			.map((entry) => {
-				if (typeof entry === 'string') return entry;
-				const entryObj = toObject(entry);
-				if (!entryObj) return undefined;
-				return (
-					toTrimmed(entryObj.text) ??
-					toTrimmed(entryObj.content) ??
-					toTrimmed(entryObj.value) ??
-					undefined
-				);
-			})
-			.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0);
-		if (textParts.length > 0) return textParts.join('\n');
-		return stringifyCodexJson(content, '');
-	}
-
-	const contentObj = toObject(content);
-	if (contentObj) {
-		return (
-			toTrimmed(contentObj.text) ??
-			toTrimmed(contentObj.content) ??
-			toTrimmed(contentObj.value) ??
-			stringifyCodexJson(contentObj, '')
-		);
-	}
-
-	return undefined;
-}
-
-function normalizeRoleAlias(value: string | undefined): string | undefined {
-	const role = toTrimmed(value)?.toLowerCase();
-	if (!role) return undefined;
-	if (role === 'human') return 'user';
-	if (role === 'ai') return 'assistant';
-	return role;
-}
-
-function resolveCodexCallId(itemObj: Record<string, unknown>): string | undefined {
-	const additionalKwargs = toObject(itemObj.additional_kwargs);
-	return (
-		toTrimmed(itemObj.call_id) ??
-		toTrimmed(itemObj.tool_call_id) ??
-		toTrimmed(itemObj.toolCallId) ??
-		toTrimmed(itemObj.id) ??
-		(additionalKwargs ? toTrimmed(additionalKwargs.tool_call_id) : undefined) ??
-		(additionalKwargs ? toTrimmed(additionalKwargs.toolCallId) : undefined)
-	);
-}
-
-function normalizeCodexFunctionCallItem(
-	itemObj: Record<string, unknown>,
-): Record<string, unknown> | undefined {
-	const callId = resolveCodexCallId(itemObj);
-	const name = toTrimmed(itemObj.name);
-	if (!callId || !name) return undefined;
-
-	const rawArguments = itemObj.arguments ?? itemObj.input ?? itemObj.args;
-	return {
-		type: 'function_call',
-		call_id: callId,
-		name,
-		arguments: stringifyCodexJson(rawArguments, '{}'),
-	};
-}
-
-function normalizeCodexFunctionCallOutputItem(
-	itemObj: Record<string, unknown>,
-): Record<string, unknown> | undefined {
-	const callId = resolveCodexCallId(itemObj);
-	if (!callId) return undefined;
-
-	const rawOutput = itemObj.output ?? itemObj.content ?? itemObj.result;
-	return {
-		type: 'function_call_output',
-		call_id: callId,
-		output: stringifyCodexJson(rawOutput, ''),
-	};
-}
-
-function normalizeAssistantToolCalls(itemObj: Record<string, unknown>): Record<string, unknown>[] {
-	const calls: Record<string, unknown>[] = [];
-	const seen = new Set<string>();
-
-	const pushCall = (
-		callId: string | undefined,
-		name: string | undefined,
-		rawArguments: unknown,
-	): void => {
-		const callIdValue = toTrimmed(callId);
-		const nameValue = toTrimmed(name);
-		if (!callIdValue || !nameValue || seen.has(callIdValue)) return;
-		seen.add(callIdValue);
-		calls.push({
-			type: 'function_call',
-			call_id: callIdValue,
-			name: nameValue,
-			arguments: stringifyCodexJson(rawArguments, '{}'),
-		});
-	};
-
-	const toolCalls = Array.isArray(itemObj.tool_calls) ? itemObj.tool_calls : [];
-	const additionalKwargs = toObject(itemObj.additional_kwargs);
-	const additionalToolCalls = Array.isArray(additionalKwargs?.tool_calls)
-		? (additionalKwargs?.tool_calls as unknown[])
-		: [];
-	const allToolCalls = [...toolCalls, ...additionalToolCalls];
-	for (const toolCall of allToolCalls) {
-		const toolCallObj = toObject(toolCall);
-		if (!toolCallObj) continue;
-		const fnObj = toObject(toolCallObj.function);
-		pushCall(
-			resolveCodexCallId(toolCallObj),
-			toTrimmed(fnObj?.name) ?? toTrimmed(toolCallObj.name),
-			fnObj?.arguments ?? fnObj?.input ?? toolCallObj.arguments ?? toolCallObj.input ?? toolCallObj.args,
-		);
-	}
-
-	const content = Array.isArray(itemObj.content) ? itemObj.content : [];
-	for (const part of content) {
-		const partObj = toObject(part);
-		if (!partObj) continue;
-		const partType = toTrimmed(partObj.type)?.toLowerCase();
-		if (partType !== 'tool-call' && partType !== 'function_call') continue;
-		pushCall(
-			toTrimmed(partObj.call_id) ?? toTrimmed(partObj.tool_call_id) ?? toTrimmed(partObj.id),
-			toTrimmed(partObj.name) ?? toTrimmed(partObj.toolName),
-			partObj.arguments ?? partObj.input ?? partObj.args,
-		);
-	}
-
-	return calls;
-}
-
-function normalizeCodexInputItem(item: unknown): unknown[] {
-	const itemObj = toObject(item);
-	if (!itemObj) {
-		if (typeof item === 'string') {
-			return [
-				{
-					role: 'user',
-					content: item,
-				},
-			];
-		}
-		return [item];
-	}
-
-	const itemType = toTrimmed(itemObj.type)?.toLowerCase();
-	if (itemType === 'function_call') {
-		const normalized = normalizeCodexFunctionCallItem(itemObj);
-		return normalized ? [normalized] : [];
-	}
-	if (
-		itemType === 'function_call_output' ||
-		itemType === 'tool_result' ||
-		itemType === 'tool-result'
-	) {
-		const normalized = normalizeCodexFunctionCallOutputItem(itemObj);
-		return normalized ? [normalized] : [];
-	}
-
-	const role = normalizeRoleAlias(toTrimmed(itemObj.role) ?? toTrimmed(itemObj.type));
-	if (role === 'tool') {
-		const normalized = normalizeCodexFunctionCallOutputItem(itemObj);
-		if (normalized) return [normalized];
-		return [
-			{
-				role: 'assistant',
-				content: normalizeCodexMessageContent(itemObj.content) ?? stringifyCodexJson(itemObj, ''),
-			},
-		];
-	}
-
-	const normalizedItems: unknown[] = [];
-	if (role === 'assistant') {
-		normalizedItems.push(...normalizeAssistantToolCalls(itemObj));
-	}
-
-	if (role === 'user' || role === 'assistant' || role === 'system' || role === 'developer') {
-		const content = normalizeCodexMessageContent(itemObj.content) ?? '';
-		normalizedItems.unshift({
-			role,
-			content,
-		});
-	}
-
-	if (normalizedItems.length > 0) return normalizedItems;
-	return [item];
-}
-
 function setInputDebugState(input: unknown, debugState: BoundToolsDebugState): void {
 	if (Array.isArray(input)) {
 		try {
@@ -2243,255 +1894,6 @@ function resolveReasoningEffortForModel(
 	return closest ?? DEFAULT_REASONING_EFFORT;
 }
 
-function normalizeResponsesCreateRequestForCodex(
-	request: unknown,
-	debugState: BoundToolsDebugState,
-	defaultModelName: string,
-	conversationId: string,
-): void {
-	const requestObj = toObject(request);
-	if (!requestObj) return;
-
-	const modelName = toTrimmed(requestObj.model) ?? defaultModelName;
-	debugState.lastModel = modelName;
-
-	const requestInput = requestObj.input;
-	const requestMessages = requestObj.messages;
-	const requestPrompt = toTrimmed(requestObj.prompt);
-	const inputSource =
-		Array.isArray(requestInput) && requestInput.length > 0
-			? requestInput
-			: Array.isArray(requestMessages) && requestMessages.length > 0
-				? requestMessages
-				: requestInput ?? requestPrompt ?? [];
-	const rawInput = Array.isArray(inputSource) ? inputSource : undefined;
-	const input = Array.isArray(rawInput)
-		? rawInput.reduce<unknown[]>((acc, item) => {
-				acc.push(...normalizeCodexInputItem(item));
-				return acc;
-			}, [])
-		: inputSource;
-
-	const include = new Set<string>();
-	// Keep include list codex-compatible; do not forward arbitrary upstream include values.
-
-	const rawReasoning = toObject(requestObj.reasoning);
-	const reasoning = rawReasoning ? { ...rawReasoning } : undefined;
-	if (reasoning) {
-		if (!toTrimmed(reasoning.summary)) {
-			reasoning.summary = 'auto';
-		}
-		include.add('reasoning.encrypted_content');
-		try {
-			debugState.lastReasoning = truncateErrorValue(JSON.stringify(reasoning));
-		} catch {
-			debugState.lastReasoning = undefined;
-		}
-	} else {
-		debugState.lastReasoning = undefined;
-	}
-
-	const rawTools = Array.isArray(requestObj.tools) ? requestObj.tools : [];
-	const usedNames = new Set<string>();
-	const tools: Record<string, unknown>[] = [];
-	const toolNames: string[] = [];
-
-	for (const rawTool of rawTools) {
-		const codexTool = asCodexFunctionTool(rawTool, usedNames);
-		if (!codexTool) continue;
-
-		const name = toTrimmed(codexTool.name);
-		if (!name) continue;
-		toolNames.push(name);
-		tools.push(codexTool);
-	}
-
-	const previousResponseId =
-		toTrimmed(requestObj.previous_response_id) ?? toTrimmed(requestObj.previousResponseId);
-	let canonicalInput = ensureCodexInputForTools(input, tools.length > 0);
-	if (tools.length > 0 && Array.isArray(canonicalInput) && canonicalInput.length === 0 && !previousResponseId) {
-		canonicalInput = [
-			{
-				role: 'user',
-				content: requestPrompt ?? 'Continue.',
-			},
-		];
-	}
-	setInputDebugState(canonicalInput, debugState);
-	const parallelToolCalls = supportsParallelToolCalls(modelName);
-	const canonicalRequest: Record<string, unknown> = {
-		model: modelName,
-		instructions: toTrimmed(requestObj.instructions) ?? DEFAULT_INSTRUCTIONS,
-		input: canonicalInput,
-		tools,
-		tool_choice: 'auto',
-		parallel_tool_calls: parallelToolCalls,
-		stream: true,
-		store: false,
-		include: Array.from(include),
-		prompt_cache_key: conversationId,
-	};
-
-	const instructions = toTrimmed(requestObj.instructions);
-	if (instructions) {
-		canonicalRequest.instructions = instructions;
-	}
-
-	if (previousResponseId) {
-		canonicalRequest.previous_response_id = previousResponseId;
-	}
-
-	const serviceTier = toTrimmed(requestObj.service_tier) ?? toTrimmed(requestObj.serviceTier);
-	if (serviceTier) {
-		canonicalRequest.service_tier = serviceTier;
-	}
-
-	if (reasoning) {
-		canonicalRequest.reasoning = reasoning;
-	}
-
-	const text = toObject(requestObj.text);
-	if (text) {
-		const verbosity = toTrimmed(text.verbosity);
-		const format = toObject(text.format);
-		if (verbosity || format) {
-			canonicalRequest.text = {
-				...(verbosity ? { verbosity } : {}),
-				...(format ? { format } : {}),
-			};
-		}
-	}
-
-	for (const key of Object.keys(requestObj)) {
-		delete requestObj[key];
-	}
-	Object.assign(requestObj, canonicalRequest);
-
-	debugState.toolNames = toolNames;
-	debugState.lastToolChoice = 'auto';
-	debugState.lastParallelToolCalls = String(parallelToolCalls);
-	debugState.lastToolsPayload =
-		tools.length > 0 ? truncateErrorValue(JSON.stringify(tools)) : undefined;
-	debugState.lastRequestKeys = Object.keys(requestObj).sort().join(',');
-}
-
-function patchModelCompletionForCodex(
-	model: unknown,
-	debugState: BoundToolsDebugState,
-	defaultModelName: string,
-	conversationId: string,
-): void {
-	const modelObj = model as {
-		completionWithRetry?: (
-			request: Record<string, unknown>,
-			requestOptions?: Record<string, unknown>,
-		) => Promise<unknown>;
-	};
-
-	if (!modelObj || typeof modelObj.completionWithRetry !== 'function') return;
-
-	const originalCompletionWithRetry = modelObj.completionWithRetry.bind(model);
-	modelObj.completionWithRetry = async (
-		request: Record<string, unknown>,
-		requestOptions?: Record<string, unknown>,
-	) => {
-		normalizeResponsesCreateRequestForCodex(
-			request,
-			debugState,
-			defaultModelName,
-			conversationId,
-		);
-		return await originalCompletionWithRetry(request, requestOptions);
-	};
-}
-
-function patchModelInvocationParamsForCodex(
-	model: unknown,
-	debugState: BoundToolsDebugState,
-	defaultModelName: string,
-	conversationId: string,
-): void {
-	const modelObj = model as {
-		invocationParams?: (options?: Record<string, unknown>) => Record<string, unknown>;
-	};
-
-	if (!modelObj || typeof modelObj.invocationParams !== 'function') return;
-
-	const originalInvocationParams = modelObj.invocationParams.bind(model);
-	modelObj.invocationParams = (options?: Record<string, unknown>) => {
-		const params = originalInvocationParams(options);
-		normalizeResponsesCreateRequestForCodex(params, debugState, defaultModelName, conversationId);
-		return params;
-	};
-}
-
-function patchModelBindToolsForCodex(
-	model: unknown,
-	debugState: BoundToolsDebugState,
-	defaultModelName: string,
-	conversationId: string,
-): void {
-	const modelObj = model as {
-		bindTools?: (tools: unknown[], kwargs?: Record<string, unknown>) => unknown;
-	};
-	if (!modelObj || typeof modelObj.bindTools !== 'function') return;
-
-	const originalBindTools = modelObj.bindTools.bind(model);
-	modelObj.bindTools = (tools: unknown[], kwargs?: Record<string, unknown>) => {
-		const toolsArray = Array.isArray(tools) ? tools : [];
-		debugState.toolNames = normalizeToolsForCodex(toolsArray);
-
-		const mergedKwargs: Record<string, unknown> = {
-			...(toObject(kwargs) ?? {}),
-			// Keep Codex backend compatibility with generic n8n tool schemas.
-			strict: false,
-		};
-
-		const boundModel = originalBindTools(toolsArray, mergedKwargs);
-		normalizeBoundModelTools(boundModel, debugState);
-		patchModelClientResponsesForCodex(boundModel, debugState, defaultModelName, conversationId);
-		patchModelInvocationParamsForCodex(boundModel, debugState, defaultModelName, conversationId);
-		patchModelCompletionForCodex(boundModel, debugState, defaultModelName, conversationId);
-		return boundModel;
-	};
-}
-
-function patchModelClientResponsesForCodex(
-	model: unknown,
-	debugState: BoundToolsDebugState,
-	defaultModelName: string,
-	conversationId: string,
-): void {
-	const modelObj = toObject(model);
-	if (!modelObj) return;
-	const clientObj = toObject(modelObj.client);
-	if (!clientObj) return;
-	const responsesObj = toObject(clientObj.responses);
-	if (!responsesObj) return;
-
-	const markerKey = '__openaiCodexPatched';
-	if (responsesObj[markerKey] === true) return;
-
-	for (const methodName of ['create', 'stream', 'parse'] as const) {
-		const maybeMethod = responsesObj[methodName];
-		if (typeof maybeMethod !== 'function') continue;
-		const originalMethod = maybeMethod.bind(responsesObj);
-		responsesObj[methodName] = (...args: unknown[]) => {
-			if (args.length > 0) {
-				normalizeResponsesCreateRequestForCodex(
-					args[0],
-					debugState,
-					defaultModelName,
-					conversationId,
-				);
-			}
-			return originalMethod(...args);
-		};
-	}
-
-	responsesObj[markerKey] = true;
-}
-
 async function refreshChatgptTokens(
 	context: AuthRequestContext,
 	auth: CodexAuthJson,
@@ -2518,18 +1920,18 @@ async function refreshChatgptTokens(
 		ignoreHttpStatusErrors: true,
 	})) as IN8nHttpFullResponse;
 
-		if (refreshResponse.statusCode < 200 || refreshResponse.statusCode > 299) {
-			if (refreshResponse.statusCode === 401) {
-				throw new ApplicationError(buildRefreshFailureMessage(refreshResponse.body));
-			}
-
-			const detail = extractBackendErrorMessage(refreshResponse.body);
-			throw new ApplicationError(
-				detail
-					? `Token refresh failed with status ${refreshResponse.statusCode}: ${detail}`
-					: `Token refresh failed with status ${refreshResponse.statusCode}`,
-			);
+	if (refreshResponse.statusCode < 200 || refreshResponse.statusCode > 299) {
+		if (refreshResponse.statusCode === 401) {
+			throw new ApplicationError(buildRefreshFailureMessage(refreshResponse.body));
 		}
+
+		const detail = extractBackendErrorMessage(refreshResponse.body);
+		throw new ApplicationError(
+			detail
+				? `Token refresh failed with status ${refreshResponse.statusCode}: ${detail}`
+				: `Token refresh failed with status ${refreshResponse.statusCode}`,
+		);
+	}
 
 	const refreshBody = normalizeRefreshResponseBody(refreshResponse.body);
 	const refreshPayload = refreshBody as TokenRefreshResponse;
@@ -2563,6 +1965,180 @@ function resolveAccountId(auth: CodexAuthJson): string | undefined {
 		extractChatgptAccountId(idToken) ??
 		extractChatgptAccountId(accessToken)
 	);
+}
+
+type AuthResolveMode = 'blocking' | 'single';
+
+type ResolvedAuthState =
+	| {
+			status: 'pending';
+			deviceState: DeviceCodeState;
+			conversationId: string;
+			initiated: boolean;
+	  }
+	| {
+			status: 'authenticated';
+			auth: CodexAuthJson;
+			conversationId: string;
+	  };
+
+function shouldRefreshAuthTokens(auth: CodexAuthJson): boolean {
+	const authTokens = toObject(auth.tokens) as CodexAuthJson['tokens'] | undefined;
+	return Boolean(
+		toTrimmed(authTokens?.refresh_token) &&
+			(isJwtExpiredOrAlmostExpired(toTrimmed(authTokens?.access_token)) ||
+				isLastRefreshStale(toTrimmed(auth.last_refresh))),
+	);
+}
+
+function getRemainingDeviceCodeTtlMs(deviceState: DeviceCodeState): number {
+	const issuedAtMs = Date.parse(deviceState.issued_at);
+	if (!Number.isFinite(issuedAtMs)) return DEVICE_CODE_EXPIRY_MS;
+	return Math.max(0, DEVICE_CODE_EXPIRY_MS - (Date.now() - issuedAtMs));
+}
+
+async function resolveNodeAuthState(
+	stateContext: PersistedStateContext,
+	authContext: AuthRequestContext,
+	runtimeStateKey: string,
+	nodeStaticData: IDataObject,
+	mode: AuthResolveMode,
+): Promise<ResolvedAuthState> {
+	const loadedState = await loadNodeState(stateContext, runtimeStateKey, nodeStaticData);
+	let auth = loadedState.codexAuthJson;
+	let deviceState = loadedState.codexDeviceAuth;
+	const conversationId = resolveConversationId(loadedState);
+
+	if (!auth || !hasUsableAuthData(auth)) {
+		auth = undefined;
+
+		if (!deviceState || isDeviceCodeStateExpired(deviceState)) {
+			deviceState = await requestDeviceCode(authContext);
+			await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
+				codexAuthJson: undefined,
+				codexDeviceAuth: deviceState,
+				conversationId,
+			});
+			return {
+				status: 'pending',
+				deviceState,
+				conversationId,
+				initiated: true,
+			};
+		}
+
+		const pollResult =
+			mode === 'blocking'
+				? await pollDeviceCodeUntilAuthorized(
+						authContext,
+						deviceState,
+						getRemainingDeviceCodeTtlMs(deviceState),
+					)
+				: await pollDeviceCode(authContext, deviceState);
+
+		if (pollResult.status === 'pending') {
+			await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
+				codexAuthJson: undefined,
+				codexDeviceAuth: deviceState,
+				conversationId,
+			});
+			return {
+				status: 'pending',
+				deviceState,
+				conversationId,
+				initiated: false,
+			};
+		}
+
+		const authorizationCode = toTrimmed(pollResult.token.authorization_code);
+		const codeVerifier = toTrimmed(pollResult.token.code_verifier);
+		if (!authorizationCode || !codeVerifier) {
+			throw new ApplicationError('Device-code login returned an invalid authorization payload');
+		}
+
+		auth = await exchangeAuthorizationCodeForTokens(authContext, authorizationCode, codeVerifier);
+		await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
+			codexAuthJson: auth,
+			codexDeviceAuth: undefined,
+			conversationId,
+		});
+	}
+
+	if (!auth) {
+		throw new ApplicationError('No valid Codex auth state found. Run device-code login again.');
+	}
+
+	if (shouldRefreshAuthTokens(auth)) {
+		auth = await refreshChatgptTokens(authContext, auth);
+	}
+
+	await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
+		codexAuthJson: auth,
+		codexDeviceAuth: undefined,
+		conversationId,
+	});
+
+	return {
+		status: 'authenticated',
+		auth,
+		conversationId,
+	};
+}
+
+function buildPendingLoginMessage(deviceState: DeviceCodeState, initiated: boolean): string {
+	return initiated
+		? `Device login initiated. Open ${deviceState.verification_url} and enter code ${deviceState.user_code}. Then run this node again to verify login.`
+		: `Device login pending. Open ${deviceState.verification_url} and enter code ${deviceState.user_code}. Then run this node again.`;
+}
+
+function resolveConfiguredModelName(context: ISupplyDataFunctions): {
+	selectedModel: string;
+	modelName: string;
+} {
+	const selectedModel = context.getNodeParameter('model', 0, DEFAULT_MODEL) as string;
+	const customModel = context.getNodeParameter('customModel', 0, '') as string;
+	const modelName =
+		selectedModel === '__custom__'
+			? toTrimmed(customModel) ?? DEFAULT_MODEL
+			: toTrimmed(selectedModel) ?? DEFAULT_MODEL;
+
+	return { selectedModel, modelName };
+}
+
+function resolveReasoningConfig(
+	context: ISupplyDataFunctions,
+	selectedModel: string,
+	modelName: string,
+): CodexResponsesReasoning | undefined {
+	const reasoningParamName = resolveReasoningEffortParameterName(selectedModel);
+	let selectedReasoningEffort = context.getNodeParameter(
+		reasoningParamName,
+		0,
+		DEFAULT_REASONING_EFFORT,
+	) as CodexReasoningEffort;
+
+	// Backward compatibility for older workflow definitions.
+	if (!selectedReasoningEffort) {
+		selectedReasoningEffort = context.getNodeParameter(
+			'reasoningEffort',
+			0,
+			DEFAULT_REASONING_EFFORT,
+		) as CodexReasoningEffort;
+	}
+
+	const resolvedReasoningEffort = resolveReasoningEffortForModel(
+		modelName,
+		selectedReasoningEffort,
+	);
+
+	if (resolvedReasoningEffort === 'none') {
+		return undefined;
+	}
+
+	return {
+		effort: resolvedReasoningEffort as ModelReasoningEffort,
+		summary: 'auto',
+	};
 }
 
 // eslint-disable-next-line @n8n/community-nodes/node-usable-as-tool
@@ -2698,102 +2274,30 @@ export class OpenAiCodexChatModel implements INodeType {
 		],
 	};
 
-		async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
+	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
 		try {
 			const runtimeStateKey = getRuntimeStateKey(this as unknown as RuntimeStateContext);
 			const stateContext = this as unknown as PersistedStateContext;
 			const nodeStaticData = this.getWorkflowStaticData('node') as IDataObject;
 			const authContext = this as unknown as AuthRequestContext;
-			const loadedState = await loadNodeState(stateContext, runtimeStateKey, nodeStaticData);
-			let auth = loadedState.codexAuthJson;
-			let deviceState = loadedState.codexDeviceAuth;
-			const conversationId = resolveConversationId(loadedState);
-
-			if (!auth || !hasUsableAuthData(auth)) {
-				auth = undefined;
-
-				if (!deviceState || isDeviceCodeStateExpired(deviceState)) {
-					deviceState = await requestDeviceCode(authContext);
-					await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
-						codexAuthJson: undefined,
-						codexDeviceAuth: deviceState,
-						conversationId,
-					});
-					return [
-						this.helpers.returnJsonArray(buildPendingVerificationPayload(deviceState)),
-					];
-				}
-
-				// Login already initiated and still valid -> verify like codex CLI:
-				// poll until authorized or device-code TTL is exhausted.
-				const issuedAtMs = Date.parse(deviceState.issued_at);
-				const remainingTtlMs = Number.isFinite(issuedAtMs)
-					? Math.max(0, DEVICE_CODE_EXPIRY_MS - (Date.now() - issuedAtMs))
-					: DEVICE_CODE_EXPIRY_MS;
-				const pollResult = await pollDeviceCodeUntilAuthorized(
-					authContext,
-					deviceState,
-					remainingTtlMs,
-				);
-				if (pollResult.status === 'pending') {
-					await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
-						codexAuthJson: undefined,
-						codexDeviceAuth: deviceState,
-						conversationId,
-					});
-					return [
-						this.helpers.returnJsonArray(buildPendingVerificationPayload(deviceState)),
-					];
-				}
-
-				const authorizationCode = toTrimmed(pollResult.token.authorization_code);
-				const codeVerifier = toTrimmed(pollResult.token.code_verifier);
-				if (!authorizationCode || !codeVerifier) {
-					throw new NodeOperationError(
-						this.getNode(),
-						'Device-code login returned an invalid authorization payload',
-					);
-				}
-
-				auth = await exchangeAuthorizationCodeForTokens(authContext, authorizationCode, codeVerifier);
-				deviceState = undefined;
-				await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
-					codexAuthJson: auth,
-					codexDeviceAuth: undefined,
-					conversationId,
-				});
-			}
-
-			if (!auth) {
-				throw new NodeOperationError(
-					this.getNode(),
-					'No valid Codex auth state found. Run device-code login again.',
-				);
-			}
-
-			const authTokens = toObject(auth.tokens) as CodexAuthJson['tokens'] | undefined;
-			const shouldRefresh = Boolean(
-				toTrimmed(authTokens?.refresh_token) &&
-					(isJwtExpiredOrAlmostExpired(toTrimmed(authTokens?.access_token)) ||
-						isLastRefreshStale(toTrimmed(auth.last_refresh))),
+			const resolved = await resolveNodeAuthState(
+				stateContext,
+				authContext,
+				runtimeStateKey,
+				nodeStaticData,
+				'blocking',
 			);
 
-			if (shouldRefresh) {
-				auth = await refreshChatgptTokens(authContext, auth);
+			if (resolved.status === 'pending') {
+				return [this.helpers.returnJsonArray(buildPendingVerificationPayload(resolved.deviceState))];
 			}
-
-			await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
-				codexAuthJson: auth,
-				codexDeviceAuth: undefined,
-				conversationId,
-			});
 
 			return [
 				this.helpers.returnJsonArray({
 					status: 'authenticated',
-					chatgpt_account_id: resolveAccountId(auth) ?? null,
-					last_refresh: toTrimmed(auth.last_refresh) ?? null,
-					conversation_id: conversationId,
+					chatgpt_account_id: resolveAccountId(resolved.auth) ?? null,
+					last_refresh: toTrimmed(resolved.auth.last_refresh) ?? null,
+					conversation_id: resolved.conversationId,
 				}),
 			];
 		} catch (error) {
@@ -2801,89 +2305,28 @@ export class OpenAiCodexChatModel implements INodeType {
 		}
 	}
 
-		async supplyData(this: ISupplyDataFunctions) {
+	async supplyData(this: ISupplyDataFunctions) {
 		try {
 			const runtimeStateKey = getRuntimeStateKey(this as unknown as RuntimeStateContext);
 			const stateContext = this as unknown as PersistedStateContext;
 			const authContext = this as unknown as AuthRequestContext;
 			const nodeStaticData = this.getWorkflowStaticData('node') as IDataObject;
-			const loadedState = await loadNodeState(stateContext, runtimeStateKey, nodeStaticData);
-			let auth = loadedState.codexAuthJson;
-			let deviceState = loadedState.codexDeviceAuth;
-			const conversationId = resolveConversationId(loadedState);
+			const resolved = await resolveNodeAuthState(
+				stateContext,
+				authContext,
+				runtimeStateKey,
+				nodeStaticData,
+				'single',
+			);
 
-			if (!auth || !hasUsableAuthData(auth)) {
-				auth = undefined;
-
-				if (!deviceState || isDeviceCodeStateExpired(deviceState)) {
-					deviceState = await requestDeviceCode(authContext);
-					await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
-						codexAuthJson: undefined,
-						codexDeviceAuth: deviceState,
-						conversationId,
-					});
-					throw new NodeOperationError(
-						this.getNode(),
-						`Device login initiated. Open ${deviceState.verification_url} and enter code ${deviceState.user_code}. Then run this node again to verify login.`,
-					);
-				}
-
-				const pollResult = await pollDeviceCode(authContext, deviceState);
-				if (pollResult.status === 'pending') {
-					await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
-						codexAuthJson: undefined,
-						codexDeviceAuth: deviceState,
-						conversationId,
-					});
-					throw new NodeOperationError(
-						this.getNode(),
-						`Device login pending. Open ${deviceState.verification_url} and enter code ${deviceState.user_code}. Then run this node again.`,
-					);
-				}
-
-				const authorizationCode = toTrimmed(pollResult.token.authorization_code);
-				const codeVerifier = toTrimmed(pollResult.token.code_verifier);
-				if (!authorizationCode || !codeVerifier) {
-					throw new NodeOperationError(
-						this.getNode(),
-						'Device-code login returned an invalid authorization payload',
-					);
-				}
-
-				auth = await exchangeAuthorizationCodeForTokens(authContext, authorizationCode, codeVerifier);
-				deviceState = undefined;
-				await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
-					codexAuthJson: auth,
-					codexDeviceAuth: undefined,
-					conversationId,
-				});
-			}
-
-			if (!auth) {
+			if (resolved.status === 'pending') {
 				throw new NodeOperationError(
 					this.getNode(),
-					'No valid Codex auth state found. Run device-code login again.',
+					buildPendingLoginMessage(resolved.deviceState, resolved.initiated),
 				);
 			}
 
-			const authTokens = toObject(auth.tokens) as CodexAuthJson['tokens'] | undefined;
-			const shouldRefresh = Boolean(
-				toTrimmed(authTokens?.refresh_token) &&
-					(isJwtExpiredOrAlmostExpired(toTrimmed(authTokens?.access_token)) ||
-						isLastRefreshStale(toTrimmed(auth.last_refresh))),
-			);
-
-			if (shouldRefresh) {
-				auth = await refreshChatgptTokens(authContext, auth);
-			}
-
-			await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
-				codexAuthJson: auth,
-				codexDeviceAuth: undefined,
-				conversationId,
-			});
-
-			const token = resolveAccessToken(auth);
+			const token = resolveAccessToken(resolved.auth);
 			if (!token) {
 				throw new NodeOperationError(
 					this.getNode(),
@@ -2891,86 +2334,51 @@ export class OpenAiCodexChatModel implements INodeType {
 				);
 			}
 
-			const resolvedChatgptAccountId = resolveAccountId(auth);
-				if (!resolvedChatgptAccountId) {
-					throw new NodeOperationError(
-						this.getNode(),
-						'Stored auth state does not include account ID and it could not be inferred from token claims',
-					);
-				}
-				const selectedModel = this.getNodeParameter('model', 0, DEFAULT_MODEL) as string;
-				const customModel = this.getNodeParameter('customModel', 0, '') as string;
-				const modelName =
-					selectedModel === '__custom__'
-						? toTrimmed(customModel) ?? DEFAULT_MODEL
-						: toTrimmed(selectedModel) ?? DEFAULT_MODEL;
-				const reasoningParamName = resolveReasoningEffortParameterName(selectedModel);
-				let selectedReasoningEffort = this.getNodeParameter(
-					reasoningParamName,
-					0,
-					DEFAULT_REASONING_EFFORT,
-				) as CodexReasoningEffort;
-				// Backward compatibility for older workflow definitions.
-				if (!selectedReasoningEffort) {
-					selectedReasoningEffort = this.getNodeParameter(
-						'reasoningEffort',
-						0,
-						DEFAULT_REASONING_EFFORT,
-					) as CodexReasoningEffort;
-				}
-				const resolvedReasoningEffort = resolveReasoningEffortForModel(
-					modelName,
-					selectedReasoningEffort,
+			const chatgptAccountId = resolveAccountId(resolved.auth);
+			if (!chatgptAccountId) {
+				throw new NodeOperationError(
+					this.getNode(),
+					'Stored auth state does not include account ID and it could not be inferred from token claims',
 				);
-				const reasoningConfig =
-					resolvedReasoningEffort === 'none'
-						? undefined
-						: {
-								effort: resolvedReasoningEffort as ModelReasoningEffort,
-								summary: 'auto' as const,
-							};
-				const boundToolsDebugState: BoundToolsDebugState = {
-					toolNames: [],
-				};
-				const defaultHeaders = {
-					Authorization: `Bearer ${token}`,
-					Accept: 'text/event-stream',
-					...resolveDefaultHeaders(resolvedChatgptAccountId, conversationId),
-				};
+			}
 
-				const codexModel = new CodexResponsesChatModel(modelName, {
-					baseUrl: DEFAULT_CHATGPT_CODEX_BASE_URL,
-					defaultHeaders,
-					defaultInstructions: DEFAULT_INSTRUCTIONS,
-					reasoning: reasoningConfig,
-					parallelToolCalls: supportsParallelToolCalls(modelName),
-					promptCacheKey: conversationId,
-					chatgptAccountId: resolvedChatgptAccountId,
-					debugState: boundToolsDebugState,
-					openStreamRequest: async (request, headers) => {
-						const response = (await this.helpers.httpRequest({
-							method: 'POST',
-							url: `${DEFAULT_CHATGPT_CODEX_BASE_URL}/responses`,
-							headers,
-							body: request,
-							json: true,
-							encoding: 'stream',
-							ignoreHttpStatusErrors: true,
-							returnFullResponse: true,
-						})) as IN8nHttpFullResponse;
+			const { selectedModel, modelName } = resolveConfiguredModelName(this);
+			const reasoningConfig = resolveReasoningConfig(this, selectedModel, modelName);
+			const boundToolsDebugState: BoundToolsDebugState = {
+				toolNames: [],
+			};
+			const defaultHeaders = {
+				Authorization: `Bearer ${token}`,
+				Accept: 'text/event-stream',
+				...resolveDefaultHeaders(chatgptAccountId, resolved.conversationId),
+			};
 
-						return response;
-					},
-				});
+			const codexModel = new CodexResponsesChatModel(modelName, {
+				baseUrl: DEFAULT_CHATGPT_CODEX_BASE_URL,
+				defaultHeaders,
+				defaultInstructions: DEFAULT_INSTRUCTIONS,
+				reasoning: reasoningConfig,
+				parallelToolCalls: supportsParallelToolCalls(modelName),
+				promptCacheKey: resolved.conversationId,
+				chatgptAccountId,
+				debugState: boundToolsDebugState,
+				openStreamRequest: async (request, headers) => {
+					const response = (await this.helpers.httpRequest({
+						method: 'POST',
+						url: `${DEFAULT_CHATGPT_CODEX_BASE_URL}/responses`,
+						headers,
+						body: request,
+						json: true,
+						encoding: 'stream',
+						ignoreHttpStatusErrors: true,
+						returnFullResponse: true,
+					})) as IN8nHttpFullResponse;
 
-				patchModelBindToolsForCodex(
-					undefined,
-					boundToolsDebugState,
-					modelName,
-					conversationId,
-				);
+					return response;
+				},
+			});
 
-				return supplyModel(this, codexModel);
+			return supplyModel(this, codexModel);
 		} catch (error) {
 			throw new NodeOperationError(this.getNode(), error as Error);
 		}

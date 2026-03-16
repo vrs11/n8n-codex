@@ -1,7 +1,7 @@
 {
 	"name": "n8n-nodes-openai-codex",
 	"version": "0.1.0",
-	"description": "n8n AI chat model node for Codex-style ChatGPT backend using manual auth values",
+	"description": "n8n AI chat model node for ChatGPT Codex backend with built-in device code auth",
 	"license": "MIT",
 	"keywords": [
 		"n8n-community-node-package",
@@ -12,11 +12,7 @@
 	],
 	"author": {
 		"name": "vrs11",
-		"email": "vrs11@example.com"
-	},
-	"repository": {
-		"type": "git",
-		"url": "https://github.com/<your-org>/n8n-nodes-openai-codex.git"
+		"email": "valentine.vrs11@gmail.com"
 	},
 	"scripts": {
 		"build": "n8n-node build",
