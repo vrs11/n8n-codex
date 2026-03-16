@@ -15,10 +15,12 @@ Follow n8n community node installation docs:
 - Device-code login flow compatible with Codex-style auth endpoints
 - Auth state persisted on disk and reused across runs
 - Automatic token refresh (proactive refresh before expiry)
-- Model selection with reasoning-effort selection per model capability
+- Dynamic model catalog from backend `/models` (cached on disk)
+- Reasoning-effort options loaded from selected model capability
 - Tool-calling support for n8n AI Agent (exact tool-name preservation)
 - Explicit context strategy switch: `Memory Only` or `Backend Chain (previous_response_id)`
 - Strict model-to-reasoning validation (invalid model/effort combinations are rejected)
+- Runtime model-substitution guard (throws if backend returns a different model slug)
 
 ## Login Flow
 
@@ -51,6 +53,12 @@ Use one strategy at a time to avoid redundant context.
 
 - Base URL: `https://chatgpt.com/backend-api/codex`
 - Originator header: `codex_cli_rs`
+
+## Model Identity Note
+
+- Asking the model "what model are you?" is not a reliable identity check.
+- Use backend metadata (`response.model`) instead.
+- This node validates backend-returned model slug against the requested model and fails fast on mismatch.
 
 ## Development
 

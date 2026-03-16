@@ -18,6 +18,7 @@ import packageJson from '../../package.json';
 import type {
 	IDataObject,
 	IExecuteFunctions,
+	ILoadOptionsFunctions,
 	IN8nHttpFullResponse,
 	INodeExecutionData,
 	INodePropertyOptions,
@@ -83,10 +84,27 @@ type SessionConversationState = {
 	updatedAt?: string;
 };
 
+type PersistedModelInfo = {
+	slug: string;
+	displayName: string;
+	priority: number;
+	supportedInApi: boolean;
+	visibility: 'list' | 'hide' | 'none';
+	supportsParallelToolCalls: boolean;
+	supportedReasoningEfforts: ModelReasoningEffort[];
+	defaultReasoningEffort: CodexReasoningEffort;
+};
+
+type ModelsCatalogState = {
+	fetchedAt: string;
+	models: PersistedModelInfo[];
+};
+
 type RuntimeNodeState = {
 	codexAuthJson?: CodexAuthJson;
 	codexDeviceAuth?: DeviceCodeState;
 	sessionConversations?: Record<string, SessionConversationState>;
+	modelsCatalog?: ModelsCatalogState;
 };
 
 type RuntimeStateContext = {
@@ -114,11 +132,12 @@ type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xh
 type ContextMode = 'memory_only' | 'chain_only';
 
 type ModelReasoningEffort = Exclude<CodexReasoningEffort, 'none'>;
+const CUSTOM_MODEL_VALUE = '__custom__';
 
 const MODEL_OPTIONS: INodePropertyOptions[] = [
 	{
 		name: 'Custom',
-		value: '__custom__',
+		value: CUSTOM_MODEL_VALUE,
 	},
 	{
 		name: 'GPT-5.4',
@@ -174,6 +193,10 @@ const MODEL_OPTIONS: INodePropertyOptions[] = [
 	},
 ];
 
+const FALLBACK_MODEL_NAME_BY_SLUG = new Map(
+	MODEL_OPTIONS.map((option) => [String(option.value).trim().toLowerCase(), option.name]),
+);
+
 const MODEL_SUPPORTS_PARALLEL_TOOL_CALLS: Readonly<Record<string, boolean>> = {
 	'gpt-5.3-codex': true,
 	'gpt-5.4': true,
@@ -223,38 +246,6 @@ const REASONING_EFFORT_LABEL: Readonly<Record<CodexReasoningEffort, string>> = {
 	xhigh: 'Extreme',
 };
 
-const REASONING_SET_LMHX: ReadonlyArray<ModelReasoningEffort> = ['low', 'medium', 'high', 'xhigh'];
-const REASONING_SET_LMH: ReadonlyArray<ModelReasoningEffort> = ['low', 'medium', 'high'];
-const REASONING_SET_MH: ReadonlyArray<ModelReasoningEffort> = ['medium', 'high'];
-const REASONING_SET_MINIMAL_LMH: ReadonlyArray<ModelReasoningEffort> = [
-	'minimal',
-	'low',
-	'medium',
-	'high',
-];
-
-function sameEffortSet(
-	current: ReadonlyArray<ModelReasoningEffort>,
-	target: ReadonlyArray<ModelReasoningEffort>,
-): boolean {
-	return (
-		current.length === target.length &&
-		current.every((value, index) => value === target[index])
-	);
-}
-
-function modelsForEffortSet(target: ReadonlyArray<ModelReasoningEffort>): ReadonlyArray<string> {
-	return Object.entries(MODEL_REASONING_EFFORTS)
-		.filter(([, efforts]) => sameEffortSet(efforts, target))
-		.map(([model]) => model);
-}
-
-const MODELS_REASONING_LMHX: ReadonlyArray<string> = modelsForEffortSet(REASONING_SET_LMHX);
-const MODELS_REASONING_LMH: ReadonlyArray<string> = modelsForEffortSet(REASONING_SET_LMH);
-const MODELS_REASONING_MH: ReadonlyArray<string> = modelsForEffortSet(REASONING_SET_MH);
-const MODELS_REASONING_MINIMAL_LMH: ReadonlyArray<string> =
-	modelsForEffortSet(REASONING_SET_MINIMAL_LMH);
-
 function reasoningEffortOptions(
 	supported: ReadonlyArray<ModelReasoningEffort>,
 ): INodePropertyOptions[] {
@@ -263,52 +254,6 @@ function reasoningEffortOptions(
 		name: REASONING_EFFORT_LABEL[value],
 		value,
 	}));
-}
-
-const REASONING_OPTIONS_LMHX = reasoningEffortOptions(REASONING_SET_LMHX);
-const REASONING_OPTIONS_LMH = reasoningEffortOptions(REASONING_SET_LMH);
-const REASONING_OPTIONS_MH = reasoningEffortOptions(REASONING_SET_MH);
-const REASONING_OPTIONS_MINIMAL_LMH = reasoningEffortOptions(REASONING_SET_MINIMAL_LMH);
-const REASONING_OPTIONS_CUSTOM = reasoningEffortOptions(ALL_REASONING_EFFORTS);
-
-function assertModelMetadataConsistency(): void {
-	const configuredModels = new Set(
-		MODEL_OPTIONS.map((option) => String(option.value).trim().toLowerCase()).filter(
-			(value) => value !== '__custom__',
-		),
-	);
-
-	const reasoningModels = new Set(Object.keys(MODEL_REASONING_EFFORTS));
-	const parallelModels = new Set(Object.keys(MODEL_SUPPORTS_PARALLEL_TOOL_CALLS));
-
-	const missingReasoning = [...configuredModels].filter((model) => !reasoningModels.has(model));
-	const missingParallel = [...configuredModels].filter((model) => !parallelModels.has(model));
-
-	if (missingReasoning.length > 0 || missingParallel.length > 0) {
-		const issues = [
-			missingReasoning.length > 0
-				? `missing reasoning profile for: ${missingReasoning.join(', ')}`
-				: undefined,
-			missingParallel.length > 0
-				? `missing parallel_tool_calls profile for: ${missingParallel.join(', ')}`
-				: undefined,
-		]
-			.filter(Boolean)
-			.join('; ');
-		throw new ApplicationError(`OpenAI codex model metadata mismatch: ${issues}`);
-	}
-}
-
-assertModelMetadataConsistency();
-
-function resolveReasoningEffortParameterName(modelName: string | undefined): string {
-	const normalized = normalizeModelName(modelName);
-	if (!normalized || normalized === '__custom__') return 'reasoningEffortCustom';
-	if (MODELS_REASONING_LMHX.includes(normalized)) return 'reasoningEffortLmhx';
-	if (MODELS_REASONING_LMH.includes(normalized)) return 'reasoningEffortLmh';
-	if (MODELS_REASONING_MH.includes(normalized)) return 'reasoningEffortMh';
-	if (MODELS_REASONING_MINIMAL_LMH.includes(normalized)) return 'reasoningEffortMinimalLmh';
-	return 'reasoningEffortCustom';
 }
 
 type PersistedStateContext = AuthRequestContext & RuntimeStateContext;
@@ -328,11 +273,13 @@ const DEFAULT_MODEL = 'gpt-5-codex';
 const TOKEN_REFRESH_INTERVAL_DAYS = 8;
 const DEVICE_CODE_EXPIRY_MS = 15 * 60 * 1000;
 const CODEX_NODE_VERSION = toTrimmed(packageJson.version) ?? '0.0.0';
+const MODELS_CLIENT_VERSION = toWholeSemver(CODEX_NODE_VERSION);
 const CODEX_USER_AGENT = `${DEFAULT_ORIGINATOR}/${CODEX_NODE_VERSION} (n8n-openai-codex)`;
 const PERSISTED_STATE_PREFIX = '.openai-codex-state';
 const DIRECT_PERSIST_DIR_ENV = 'N8N_OPENAI_CODEX_STATE_DIR';
 const ALLOW_PARALLEL_TOOL_CALLS =
 	toTrimmed(process.env.N8N_OPENAI_CODEX_ALLOW_PARALLEL_TOOLS) === 'true';
+const MODEL_CATALOG_CACHE_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_INSTRUCTIONS = 'You are Codex.';
 const DEFAULT_CONTEXT_MODE: ContextMode = 'memory_only';
 const MAX_EXPLICIT_SESSION_KEY_LENGTH = 512;
@@ -1069,6 +1016,27 @@ function toStringValue(value: unknown): string | undefined {
 	return typeof value === 'string' ? value : undefined;
 }
 
+function toWholeSemver(version: string): string {
+	const trimmed = version.trim();
+	const match = trimmed.match(/^(\d+\.\d+\.\d+)/);
+	return match?.[1] ?? trimmed;
+}
+
+function toFiniteNumber(value: unknown): number | undefined {
+	if (typeof value === 'number' && Number.isFinite(value)) {
+		return value;
+	}
+
+	if (typeof value === 'string') {
+		const parsed = Number(value.trim());
+		if (Number.isFinite(parsed)) {
+			return parsed;
+		}
+	}
+
+	return undefined;
+}
+
 function toObject(value: unknown): Record<string, unknown> | undefined {
 	if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
 	return value as Record<string, unknown>;
@@ -1265,8 +1233,17 @@ function hasSessionConversations(state: RuntimeNodeState): boolean {
 	return Boolean(sessions && Object.keys(sessions).length > 0);
 }
 
+function hasModelsCatalogState(state: RuntimeNodeState): boolean {
+	return Boolean(state.modelsCatalog && state.modelsCatalog.models.length > 0);
+}
+
 function hasRuntimeState(state: RuntimeNodeState): boolean {
-	return Boolean(state.codexAuthJson || state.codexDeviceAuth || hasSessionConversations(state));
+	return Boolean(
+		state.codexAuthJson ||
+			state.codexDeviceAuth ||
+			hasSessionConversations(state) ||
+			hasModelsCatalogState(state),
+	);
 }
 
 function setRuntimeAuthState(key: string, auth: CodexAuthJson | undefined): void {
@@ -1308,6 +1285,24 @@ function setRuntimeSessionConversations(
 		current.sessionConversations = { ...sessionConversations };
 	} else {
 		delete current.sessionConversations;
+	}
+
+	if (hasRuntimeState(current)) {
+		runtimeNodeState.set(key, current);
+	} else {
+		runtimeNodeState.delete(key);
+	}
+}
+
+function setRuntimeModelsCatalogState(key: string, modelsCatalog: ModelsCatalogState | undefined): void {
+	const current = getRuntimeState(key);
+	if (modelsCatalog && modelsCatalog.models.length > 0) {
+		current.modelsCatalog = {
+			fetchedAt: modelsCatalog.fetchedAt,
+			models: modelsCatalog.models.map((model) => ({ ...model })),
+		};
+	} else {
+		delete current.modelsCatalog;
 	}
 
 	if (hasRuntimeState(current)) {
@@ -1374,6 +1369,218 @@ function normalizeSessionConversations(
 	return Object.keys(normalized).length > 0 ? normalized : undefined;
 }
 
+function normalizeModelVisibility(value: unknown): PersistedModelInfo['visibility'] {
+	const normalized = toTrimmed(value)?.toLowerCase();
+	if (normalized === 'hide') return 'hide';
+	if (normalized === 'none') return 'none';
+	return 'list';
+}
+
+function normalizeModelReasoningEffort(value: unknown): ModelReasoningEffort | undefined {
+	const normalized = toTrimmed(value)?.toLowerCase();
+	if (
+		normalized === 'minimal' ||
+		normalized === 'low' ||
+		normalized === 'medium' ||
+		normalized === 'high' ||
+		normalized === 'xhigh'
+	) {
+		return normalized;
+	}
+
+	// Some payloads use `mid`; normalize to protocol value.
+	if (normalized === 'mid') {
+		return 'medium';
+	}
+
+	return undefined;
+}
+
+function defaultReasoningEffortForSupported(
+	supported: ReadonlyArray<ModelReasoningEffort>,
+	preferred?: unknown,
+): CodexReasoningEffort {
+	const normalizedPreferred = normalizeModelReasoningEffort(preferred);
+	if (normalizedPreferred && supported.includes(normalizedPreferred)) {
+		return normalizedPreferred;
+	}
+	return supported.includes('medium') ? 'medium' : supported[0] ?? 'none';
+}
+
+function normalizePersistedModelInfo(value: unknown): PersistedModelInfo | undefined {
+	const obj = toObject(value);
+	if (!obj) return undefined;
+
+	const slug = normalizeModelName(toTrimmed(obj.slug));
+	if (!slug) return undefined;
+
+	const displayName =
+		toTrimmed(obj.displayName ?? obj.display_name) ??
+		FALLBACK_MODEL_NAME_BY_SLUG.get(slug) ??
+		slug;
+	const priority = Math.floor(toFiniteNumber(obj.priority) ?? 10_000);
+	const supportedInApi =
+		typeof obj.supportedInApi === 'boolean'
+			? obj.supportedInApi
+			: typeof obj.supported_in_api === 'boolean'
+				? obj.supported_in_api
+				: true;
+	const supportsParallelToolCalls =
+		typeof obj.supportsParallelToolCalls === 'boolean'
+			? obj.supportsParallelToolCalls
+			: typeof obj.supports_parallel_tool_calls === 'boolean'
+				? obj.supports_parallel_tool_calls
+				: Boolean(MODEL_SUPPORTS_PARALLEL_TOOL_CALLS[slug]);
+
+	const supportedReasoningEffortsRaw = Array.isArray(obj.supportedReasoningEfforts)
+		? obj.supportedReasoningEfforts
+		: Array.isArray(obj.supported_reasoning_efforts)
+			? obj.supported_reasoning_efforts
+			: undefined;
+	let supportedReasoningEfforts = supportedReasoningEffortsRaw
+		?.map((entry) => normalizeModelReasoningEffort(entry))
+		.filter((entry): entry is ModelReasoningEffort => Boolean(entry));
+
+	if (!supportedReasoningEfforts || supportedReasoningEfforts.length === 0) {
+		const fallbackEfforts = MODEL_REASONING_EFFORTS[slug];
+		supportedReasoningEfforts = fallbackEfforts ? [...fallbackEfforts] : [];
+	}
+
+	return {
+		slug,
+		displayName,
+		priority,
+		supportedInApi,
+		visibility: normalizeModelVisibility(obj.visibility),
+		supportsParallelToolCalls,
+		supportedReasoningEfforts,
+		defaultReasoningEffort: defaultReasoningEffortForSupported(
+			supportedReasoningEfforts,
+			obj.defaultReasoningEffort ?? obj.default_reasoning_effort,
+		),
+	};
+}
+
+function normalizeModelsCatalogState(value: unknown): ModelsCatalogState | undefined {
+	const obj = toObject(value);
+	if (!obj) return undefined;
+
+	const fetchedAt = toTrimmed(obj.fetchedAt ?? obj.fetched_at);
+	if (!fetchedAt || !Number.isFinite(Date.parse(fetchedAt))) {
+		return undefined;
+	}
+
+	const rawModels = Array.isArray(obj.models) ? obj.models : [];
+	const bySlug = new Map<string, PersistedModelInfo>();
+	for (const rawModel of rawModels) {
+		const normalized = normalizePersistedModelInfo(rawModel);
+		if (!normalized) continue;
+		bySlug.set(normalized.slug, normalized);
+	}
+
+	const models = [...bySlug.values()].sort((a, b) =>
+		a.priority === b.priority ? a.slug.localeCompare(b.slug) : a.priority - b.priority,
+	);
+	if (models.length === 0) {
+		return undefined;
+	}
+
+	return {
+		fetchedAt,
+		models,
+	};
+}
+
+function buildFallbackModelsCatalog(): ModelsCatalogState {
+	const models: PersistedModelInfo[] = [];
+	let priority = 1000;
+
+	for (const option of MODEL_OPTIONS) {
+		const value = normalizeModelName(String(option.value));
+		if (!value || value === CUSTOM_MODEL_VALUE) continue;
+
+		const supportedReasoningEfforts = MODEL_REASONING_EFFORTS[value]
+			? [...MODEL_REASONING_EFFORTS[value]]
+			: [];
+
+		models.push({
+			slug: value,
+			displayName: option.name,
+			priority,
+			supportedInApi: true,
+			visibility: 'list',
+			supportsParallelToolCalls: Boolean(MODEL_SUPPORTS_PARALLEL_TOOL_CALLS[value]),
+			supportedReasoningEfforts,
+			defaultReasoningEffort: defaultReasoningEffortForSupported(supportedReasoningEfforts),
+		});
+
+		priority += 1;
+	}
+
+	return {
+		fetchedAt: new Date(0).toISOString(),
+		models,
+	};
+}
+
+const FALLBACK_MODELS_CATALOG = buildFallbackModelsCatalog();
+
+function mergeWithFallbackCatalog(catalog: ModelsCatalogState | undefined): ModelsCatalogState {
+	if (!catalog || catalog.models.length === 0) {
+		return FALLBACK_MODELS_CATALOG;
+	}
+
+	const merged = new Map<string, PersistedModelInfo>();
+	for (const model of FALLBACK_MODELS_CATALOG.models) {
+		merged.set(model.slug, model);
+	}
+	for (const model of catalog.models) {
+		merged.set(model.slug, model);
+	}
+
+	return {
+		fetchedAt: catalog.fetchedAt,
+		models: [...merged.values()].sort((a, b) =>
+			a.priority === b.priority ? a.slug.localeCompare(b.slug) : a.priority - b.priority,
+		),
+	};
+}
+
+function isModelsCatalogFresh(catalog: ModelsCatalogState | undefined): boolean {
+	if (!catalog) return false;
+	const fetchedAtMs = Date.parse(catalog.fetchedAt);
+	if (!Number.isFinite(fetchedAtMs)) return false;
+	return fetchedAtMs + MODEL_CATALOG_CACHE_TTL_MS > Date.now();
+}
+
+function getModelRecordFromCatalog(
+	catalog: ModelsCatalogState | undefined,
+	modelName: string | undefined,
+): PersistedModelInfo | undefined {
+	const normalized = normalizeModelName(modelName);
+	if (!normalized) return undefined;
+	return catalog?.models.find((model) => model.slug === normalized);
+}
+
+function getModelOptionsFromCatalog(catalog: ModelsCatalogState): INodePropertyOptions[] {
+	const options: INodePropertyOptions[] = [
+		{
+			name: 'Custom',
+			value: CUSTOM_MODEL_VALUE,
+		},
+	];
+
+	for (const model of catalog.models) {
+		if (!model.supportedInApi || model.visibility !== 'list') continue;
+		options.push({
+			name: model.displayName,
+			value: model.slug,
+		});
+	}
+
+	return options;
+}
+
 function normalizePersistedState(value: unknown): RuntimeNodeState {
 	const parsed = toObject(value);
 	if (!parsed) return {};
@@ -1391,6 +1598,11 @@ function normalizePersistedState(value: unknown): RuntimeNodeState {
 	const sessionConversations = normalizeSessionConversations(parsed.sessionConversations);
 	if (sessionConversations) {
 		state.sessionConversations = sessionConversations;
+	}
+
+	const modelsCatalog = normalizeModelsCatalogState(parsed.modelsCatalog ?? parsed.models_catalog);
+	if (modelsCatalog) {
+		state.modelsCatalog = modelsCatalog;
 	}
 
 	return state;
@@ -1436,6 +1648,13 @@ async function writePersistedState(
 		payload.sessionConversations = state.sessionConversations as unknown as IDataObject;
 	}
 
+	if (state.modelsCatalog && state.modelsCatalog.models.length > 0) {
+		payload.modelsCatalog = {
+			fetchedAt: state.modelsCatalog.fetchedAt,
+			models: state.modelsCatalog.models.map((model) => ({ ...model })),
+		} as unknown as IDataObject;
+	}
+
 	try {
 		await mkdir(dirname(filePath), { recursive: true });
 		const tempPath = `${filePath}.tmp`;
@@ -1467,11 +1686,15 @@ async function loadNodeState(
 		nodeStaticData.sessionConversations ??
 		runtimeState.sessionConversations;
 	const sessionConversations = normalizeSessionConversations(sessionConversationsRaw);
+	const modelsCatalogRaw =
+		persistedState.modelsCatalog ?? nodeStaticData.modelsCatalog ?? runtimeState.modelsCatalog;
+	const modelsCatalog = normalizeModelsCatalogState(modelsCatalogRaw);
 
 	return {
 		codexAuthJson: authRaw ? normalizeAuthJson(authRaw) : undefined,
 		codexDeviceAuth: normalizeDeviceCodeState(deviceRaw),
 		sessionConversations,
+		modelsCatalog,
 	};
 }
 
@@ -1499,9 +1722,19 @@ async function saveNodeState(
 		delete nodeStaticData.sessionConversations;
 	}
 
+	if (state.modelsCatalog && state.modelsCatalog.models.length > 0) {
+		nodeStaticData.modelsCatalog = {
+			fetchedAt: state.modelsCatalog.fetchedAt,
+			models: state.modelsCatalog.models.map((model) => ({ ...model })),
+		} as unknown as IDataObject;
+	} else {
+		delete nodeStaticData.modelsCatalog;
+	}
+
 	setRuntimeAuthState(runtimeStateKey, state.codexAuthJson);
 	setRuntimeDeviceState(runtimeStateKey, state.codexDeviceAuth);
 	setRuntimeSessionConversations(runtimeStateKey, state.sessionConversations);
+	setRuntimeModelsCatalogState(runtimeStateKey, state.modelsCatalog);
 
 	await writePersistedState(context, state);
 }
@@ -1998,7 +2231,10 @@ function sanitizeToolJsonSchema(rawSchema: unknown): Record<string, unknown> {
 	};
 }
 
-function supportsParallelToolCalls(modelName: string | undefined): boolean {
+function supportsParallelToolCalls(
+	modelName: string | undefined,
+	modelsCatalog?: ModelsCatalogState,
+): boolean {
 	if (!ALLOW_PARALLEL_TOOL_CALLS) {
 		// Default to serial tool calls because chatgpt codex backend often rejects
 		// parallel_tool_calls=true for generic n8n tool payloads.
@@ -2009,6 +2245,9 @@ function supportsParallelToolCalls(modelName: string | undefined): boolean {
 
 	const normalized = modelName.trim().toLowerCase();
 	if (!normalized) return false;
+
+	const fromCatalog = getModelRecordFromCatalog(modelsCatalog, normalized);
+	if (fromCatalog) return fromCatalog.supportsParallelToolCalls;
 
 	const known = MODEL_SUPPORTS_PARALLEL_TOOL_CALLS[normalized];
 	if (typeof known === 'boolean') return known;
@@ -2048,9 +2287,16 @@ function setInputDebugState(input: unknown, debugState: BoundToolsDebugState): v
 
 function getModelReasoningEfforts(
 	modelName: string | undefined,
+	modelsCatalog?: ModelsCatalogState,
 ): ReadonlyArray<ModelReasoningEffort> | undefined {
 	const normalized = normalizeModelName(modelName);
 	if (!normalized) return undefined;
+
+	const catalogModel = getModelRecordFromCatalog(modelsCatalog, normalized);
+	if (catalogModel && catalogModel.supportedReasoningEfforts.length > 0) {
+		return catalogModel.supportedReasoningEfforts;
+	}
+
 	return MODEL_REASONING_EFFORTS[normalized];
 }
 
@@ -2174,6 +2420,182 @@ function resolveAccountId(auth: CodexAuthJson): string | undefined {
 	);
 }
 
+function normalizeRemoteSupportedReasoningEfforts(value: unknown): ModelReasoningEffort[] {
+	const raw = Array.isArray(value) ? value : [];
+	const normalized: ModelReasoningEffort[] = [];
+
+	for (const entry of raw) {
+		const effortValue =
+			toTrimmed(entry) ?? toTrimmed(toObject(entry)?.effort) ?? toTrimmed(toObject(entry)?.value);
+		const effort = normalizeModelReasoningEffort(effortValue);
+		if (!effort || normalized.includes(effort)) continue;
+		normalized.push(effort);
+	}
+
+	return normalized;
+}
+
+function normalizeRemoteModelInfo(value: unknown): PersistedModelInfo | undefined {
+	const obj = toObject(value);
+	if (!obj) return undefined;
+
+	const slug = normalizeModelName(toTrimmed(obj.slug));
+	if (!slug) return undefined;
+
+	const supportedReasoningEfforts = normalizeRemoteSupportedReasoningEfforts(
+		obj.supported_reasoning_levels,
+	);
+
+	return {
+		slug,
+		displayName: toTrimmed(obj.display_name) ?? FALLBACK_MODEL_NAME_BY_SLUG.get(slug) ?? slug,
+		priority: Math.floor(toFiniteNumber(obj.priority) ?? 10_000),
+		supportedInApi:
+			typeof obj.supported_in_api === 'boolean' ? obj.supported_in_api : true,
+		visibility: normalizeModelVisibility(obj.visibility),
+		supportsParallelToolCalls: Boolean(obj.supports_parallel_tool_calls),
+		supportedReasoningEfforts:
+			supportedReasoningEfforts.length > 0
+				? supportedReasoningEfforts
+				: MODEL_REASONING_EFFORTS[slug]
+					? [...MODEL_REASONING_EFFORTS[slug]]
+					: [],
+		defaultReasoningEffort: defaultReasoningEffortForSupported(
+			supportedReasoningEfforts.length > 0
+				? supportedReasoningEfforts
+				: MODEL_REASONING_EFFORTS[slug]
+					? [...MODEL_REASONING_EFFORTS[slug]]
+					: [],
+			obj.default_reasoning_level,
+		),
+	};
+}
+
+async function fetchModelsCatalogFromBackend(
+	context: AuthRequestContext,
+	accessToken: string,
+	chatgptAccountId: string,
+): Promise<ModelsCatalogState> {
+	const response = (await context.helpers.httpRequest({
+		method: 'GET',
+		url: `${DEFAULT_CHATGPT_CODEX_BASE_URL}/models?client_version=${encodeURIComponent(MODELS_CLIENT_VERSION)}`,
+		headers: {
+			Authorization: `Bearer ${accessToken}`,
+			Accept: 'application/json',
+			...resolveDefaultHeaders(chatgptAccountId),
+		},
+		json: true,
+		returnFullResponse: true,
+		ignoreHttpStatusErrors: true,
+	})) as IN8nHttpFullResponse;
+
+	if (response.statusCode < 200 || response.statusCode > 299) {
+		const detail = extractBackendErrorMessage(response.body);
+		throw new ApplicationError(
+			detail
+				? `Failed to fetch model catalog. status=${response.statusCode} message=${detail}`
+				: `Failed to fetch model catalog. status=${response.statusCode}`,
+		);
+	}
+
+	const body = toObject(response.body);
+	const rawModels = Array.isArray(body?.models) ? body.models : [];
+	const parsedBySlug = new Map<string, PersistedModelInfo>();
+	for (const rawModel of rawModels) {
+		const normalized = normalizeRemoteModelInfo(rawModel);
+		if (!normalized) continue;
+		parsedBySlug.set(normalized.slug, normalized);
+	}
+
+	if (parsedBySlug.size === 0) {
+		throw new ApplicationError('Model catalog response did not include any valid model metadata');
+	}
+
+	return mergeWithFallbackCatalog({
+		fetchedAt: new Date().toISOString(),
+		models: [...parsedBySlug.values()],
+	});
+}
+
+async function resolveModelsCatalogForExecution(
+	stateContext: PersistedStateContext,
+	authContext: AuthRequestContext,
+	runtimeStateKey: string,
+	nodeStaticData: IDataObject,
+	auth: CodexAuthJson,
+): Promise<ModelsCatalogState> {
+	const loadedState = await loadNodeState(stateContext, runtimeStateKey, nodeStaticData);
+	if (isModelsCatalogFresh(loadedState.modelsCatalog)) {
+		return mergeWithFallbackCatalog(loadedState.modelsCatalog);
+	}
+
+	const accessToken = resolveAccessToken(auth);
+	const accountId = resolveAccountId(auth);
+	if (!accessToken || !accountId) {
+		return mergeWithFallbackCatalog(loadedState.modelsCatalog);
+	}
+
+	try {
+		const refreshedCatalog = await fetchModelsCatalogFromBackend(authContext, accessToken, accountId);
+		const nextState: RuntimeNodeState = {
+			...loadedState,
+			codexAuthJson: deepCloneAuthJson(auth),
+			codexDeviceAuth: undefined,
+			modelsCatalog: refreshedCatalog,
+		};
+		await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, nextState);
+		return refreshedCatalog;
+	} catch {
+		return mergeWithFallbackCatalog(loadedState.modelsCatalog);
+	}
+}
+
+async function resolveModelsCatalogForLoadOptions(
+	context: ILoadOptionsFunctions,
+): Promise<ModelsCatalogState> {
+	const stateContext = context as unknown as PersistedStateContext;
+	const authContext = context as unknown as AuthRequestContext;
+	const runtimeStateKey = getRuntimeStateKey(context as unknown as RuntimeStateContext);
+	const nodeStaticData = context.getWorkflowStaticData('node') as IDataObject;
+	const loadedState = await loadNodeState(stateContext, runtimeStateKey, nodeStaticData);
+
+	if (isModelsCatalogFresh(loadedState.modelsCatalog)) {
+		return mergeWithFallbackCatalog(loadedState.modelsCatalog);
+	}
+
+	let auth = loadedState.codexAuthJson;
+	if (!auth || !hasUsableAuthData(auth)) {
+		return mergeWithFallbackCatalog(loadedState.modelsCatalog);
+	}
+
+	if (shouldRefreshAuthTokens(auth)) {
+		try {
+			auth = await refreshChatgptTokens(authContext, auth);
+		} catch {
+			return mergeWithFallbackCatalog(loadedState.modelsCatalog);
+		}
+	}
+
+	const accessToken = resolveAccessToken(auth);
+	const accountId = resolveAccountId(auth);
+	if (!accessToken || !accountId) {
+		return mergeWithFallbackCatalog(loadedState.modelsCatalog);
+	}
+
+	try {
+		const refreshedCatalog = await fetchModelsCatalogFromBackend(authContext, accessToken, accountId);
+		await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
+			...loadedState,
+			codexAuthJson: deepCloneAuthJson(auth),
+			codexDeviceAuth: undefined,
+			modelsCatalog: refreshedCatalog,
+		});
+		return refreshedCatalog;
+	} catch {
+		return mergeWithFallbackCatalog(loadedState.modelsCatalog);
+	}
+}
+
 type AuthResolveMode = 'blocking' | 'single';
 
 type ResolvedAuthState =
@@ -2218,11 +2640,12 @@ async function resolveNodeAuthState(
 
 		if (!deviceState || isDeviceCodeStateExpired(deviceState)) {
 			deviceState = await requestDeviceCode(authContext);
-			await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
-				codexAuthJson: undefined,
-				codexDeviceAuth: deviceState,
-				sessionConversations: loadedState.sessionConversations,
-			});
+				await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
+					codexAuthJson: undefined,
+					codexDeviceAuth: deviceState,
+					sessionConversations: loadedState.sessionConversations,
+					modelsCatalog: loadedState.modelsCatalog,
+				});
 			return {
 				status: 'pending',
 				deviceState,
@@ -2240,11 +2663,12 @@ async function resolveNodeAuthState(
 				: await pollDeviceCode(authContext, deviceState);
 
 		if (pollResult.status === 'pending') {
-			await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
-				codexAuthJson: undefined,
-				codexDeviceAuth: deviceState,
-				sessionConversations: loadedState.sessionConversations,
-			});
+				await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
+					codexAuthJson: undefined,
+					codexDeviceAuth: deviceState,
+					sessionConversations: loadedState.sessionConversations,
+					modelsCatalog: loadedState.modelsCatalog,
+				});
 			return {
 				status: 'pending',
 				deviceState,
@@ -2259,11 +2683,12 @@ async function resolveNodeAuthState(
 		}
 
 		auth = await exchangeAuthorizationCodeForTokens(authContext, authorizationCode, codeVerifier);
-		await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
-			codexAuthJson: auth,
-			codexDeviceAuth: undefined,
-			sessionConversations: loadedState.sessionConversations,
-		});
+			await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
+				codexAuthJson: auth,
+				codexDeviceAuth: undefined,
+				sessionConversations: loadedState.sessionConversations,
+				modelsCatalog: loadedState.modelsCatalog,
+			});
 	}
 
 	if (!auth) {
@@ -2278,6 +2703,7 @@ async function resolveNodeAuthState(
 		codexAuthJson: auth,
 		codexDeviceAuth: undefined,
 		sessionConversations: loadedState.sessionConversations,
+		modelsCatalog: loadedState.modelsCatalog,
 	});
 
 	return {
@@ -2353,28 +2779,29 @@ function upsertSessionConversationState(
 	};
 }
 
-function resolveConfiguredModelName(context: ISupplyDataFunctions): {
-	selectedModel: string;
-	modelName: string;
-} {
+function resolveConfiguredModelName(context: ISupplyDataFunctions): { modelName: string } {
 	const selectedModel = context.getNodeParameter('model', 0, DEFAULT_MODEL) as string;
 	const customModel = context.getNodeParameter('customModel', 0, '') as string;
-	const modelName =
-		selectedModel === '__custom__'
-			? toTrimmed(customModel) ?? DEFAULT_MODEL
-			: toTrimmed(selectedModel) ?? DEFAULT_MODEL;
+	const modelName = resolveEffectiveModelName(selectedModel, customModel);
 
-	return { selectedModel, modelName };
+	return { modelName };
+}
+
+function resolveEffectiveModelName(selectedModel: string | undefined, customModel: string | undefined): string {
+	const selected = toTrimmed(selectedModel);
+	if (selected === CUSTOM_MODEL_VALUE) {
+		return normalizeModelName(customModel) ?? DEFAULT_MODEL;
+	}
+	return normalizeModelName(selected) ?? DEFAULT_MODEL;
 }
 
 function resolveReasoningConfig(
 	context: ISupplyDataFunctions,
-	selectedModel: string,
 	modelName: string,
+	modelsCatalog: ModelsCatalogState,
 ): CodexResponsesReasoning | undefined {
-	const reasoningParamName = resolveReasoningEffortParameterName(selectedModel);
 	let selectedReasoningEffort = context.getNodeParameter(
-		reasoningParamName,
+		'reasoningEffort',
 		0,
 		DEFAULT_REASONING_EFFORT,
 	) as CodexReasoningEffort;
@@ -2399,7 +2826,7 @@ function resolveReasoningConfig(
 		return undefined;
 	}
 
-	const supportedEfforts = getModelReasoningEfforts(modelName);
+	const supportedEfforts = getModelReasoningEfforts(modelName, modelsCatalog);
 	if (!supportedEfforts) {
 		throw new NodeOperationError(
 			context.getNode(),
@@ -2464,12 +2891,16 @@ export class OpenAiCodexChatModel implements INodeType {
 				default: '',
 			},
 			{
-				displayName: 'Model',
+				displayName: 'Model Name or ID',
 				name: 'model',
 				type: 'options',
 				default: DEFAULT_MODEL,
 				options: MODEL_OPTIONS,
-				description: 'Model slug to use with the Codex backend',
+				typeOptions: {
+					loadOptionsMethod: 'getCodexModelOptions',
+				},
+				description:
+					'Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>',
 			},
 			{
 				displayName: 'Custom Model',
@@ -2479,7 +2910,7 @@ export class OpenAiCodexChatModel implements INodeType {
 				placeholder: 'e.g. gpt-5.4',
 				displayOptions: {
 					show: {
-						model: ['__custom__'],
+						model: [CUSTOM_MODEL_VALUE],
 					},
 				},
 				description: 'Custom model slug',
@@ -2520,72 +2951,38 @@ export class OpenAiCodexChatModel implements INodeType {
 					'Required for Backend Chain mode. Use a stable key (for example user ID or session ID) so previous_response_id chaining can continue.',
 			},
 			{
-				displayName: 'Reasoning Effort',
-				name: 'reasoningEffortLmhx',
+				displayName: 'Reasoning Effort Name or ID',
+				name: 'reasoningEffort',
 				type: 'options',
 				default: DEFAULT_REASONING_EFFORT,
-				options: REASONING_OPTIONS_LMHX,
-				displayOptions: {
-					show: {
-						model: [...MODELS_REASONING_LMHX],
-					},
-				},
-				description: 'Supported by this model: Low, Mid, High, Extreme',
-			},
-			{
-				displayName: 'Reasoning Effort',
-				name: 'reasoningEffortLmh',
-				type: 'options',
-				default: DEFAULT_REASONING_EFFORT,
-				options: REASONING_OPTIONS_LMH,
-				displayOptions: {
-					show: {
-						model: [...MODELS_REASONING_LMH],
-					},
-				},
-				description: 'Supported by this model: Low, Mid, High',
-			},
-			{
-				displayName: 'Reasoning Effort',
-				name: 'reasoningEffortMinimalLmh',
-				type: 'options',
-				default: DEFAULT_REASONING_EFFORT,
-				options: REASONING_OPTIONS_MINIMAL_LMH,
-				displayOptions: {
-					show: {
-						model: [...MODELS_REASONING_MINIMAL_LMH],
-					},
-				},
-				description: 'Supported by this model: Minimal, Low, Mid, High',
-			},
-			{
-				displayName: 'Reasoning Effort',
-				name: 'reasoningEffortMh',
-				type: 'options',
-				default: DEFAULT_REASONING_EFFORT,
-				options: REASONING_OPTIONS_MH,
-				displayOptions: {
-					show: {
-						model: [...MODELS_REASONING_MH],
-					},
-				},
-				description: 'Supported by this model: Mid, High',
-			},
-			{
-				displayName: 'Reasoning Effort',
-				name: 'reasoningEffortCustom',
-				type: 'options',
-				default: DEFAULT_REASONING_EFFORT,
-				options: REASONING_OPTIONS_CUSTOM,
-				displayOptions: {
-					show: {
-						model: ['__custom__'],
-					},
+				options: reasoningEffortOptions(ALL_REASONING_EFFORTS),
+				typeOptions: {
+					loadOptionsMethod: 'getCodexReasoningEffortOptions',
+					loadOptionsDependsOn: ['model', 'customModel'],
 				},
 				description:
-					'Custom model mode. Shows all effort levels; unsupported values are normalized at runtime.',
+					'Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>',
 			},
 		],
+	};
+
+	methods = {
+		loadOptions: {
+			async getCodexModelOptions(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const catalog = await resolveModelsCatalogForLoadOptions(this);
+				return getModelOptionsFromCatalog(catalog);
+			},
+			async getCodexReasoningEffortOptions(
+				this: ILoadOptionsFunctions,
+			): Promise<INodePropertyOptions[]> {
+				const catalog = await resolveModelsCatalogForLoadOptions(this);
+				const selectedModel = this.getCurrentNodeParameter('model') as string | undefined;
+				const customModel = this.getCurrentNodeParameter('customModel') as string | undefined;
+				const modelName = resolveEffectiveModelName(selectedModel, customModel);
+				const supportedEfforts = getModelReasoningEfforts(modelName, catalog) ?? [];
+				return reasoningEffortOptions(supportedEfforts);
+			},
+		},
 	};
 
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
@@ -2656,8 +3053,15 @@ export class OpenAiCodexChatModel implements INodeType {
 				);
 			}
 
-			const { selectedModel, modelName } = resolveConfiguredModelName(this);
-			const reasoningConfig = resolveReasoningConfig(this, selectedModel, modelName);
+				const modelsCatalog = await resolveModelsCatalogForExecution(
+					stateContext,
+					authContext,
+					runtimeStateKey,
+					nodeStaticData,
+					resolved.auth,
+				);
+				const { modelName } = resolveConfiguredModelName(this);
+				const reasoningConfig = resolveReasoningConfig(this, modelName, modelsCatalog);
 			const chainRequestSignature = buildChainRequestSignature(modelName, reasoningConfig);
 			const contextMode = resolveContextMode(this);
 			const explicitSessionKey =
@@ -2695,7 +3099,7 @@ export class OpenAiCodexChatModel implements INodeType {
 				contextMode,
 				defaultInstructions: DEFAULT_INSTRUCTIONS,
 				reasoning: reasoningConfig,
-				parallelToolCalls: supportsParallelToolCalls(modelName),
+					parallelToolCalls: supportsParallelToolCalls(modelName, modelsCatalog),
 				sessionKey: explicitSessionKey,
 				previousResponseId,
 				savePreviousResponseId: explicitSessionKey
