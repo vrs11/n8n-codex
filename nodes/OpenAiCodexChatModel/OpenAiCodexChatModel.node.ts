@@ -79,6 +79,7 @@ type AuthRequestContext = Pick<ISupplyDataFunctions, 'helpers'>;
 
 type SessionConversationState = {
 	previousResponseId?: string;
+	requestSignature?: string;
 	updatedAt?: string;
 };
 
@@ -104,6 +105,7 @@ type BoundToolsDebugState = {
 	lastRequestKeys?: string;
 	lastReasoning?: string;
 	lastContextMode?: ContextMode;
+	lastChainSignature?: string;
 	lastSessionKey?: string;
 	lastPreviousResponseId?: string;
 };
@@ -769,6 +771,7 @@ class CodexResponsesChatModel extends BaseChatModel {
 		const include = this.config.reasoning ? ['reasoning.encrypted_content'] : [];
 		const sessionKey = toTrimmed(this.config.sessionKey);
 		const promptCacheKey = sessionKey ?? requestTraceId;
+		const chainSignature = buildChainRequestSignature(this.modelId, this.config.reasoning);
 
 		const request: CodexResponsesRequest = {
 			model: this.modelId,
@@ -798,6 +801,7 @@ class CodexResponsesChatModel extends BaseChatModel {
 			? truncateErrorValue(JSON.stringify(this.config.reasoning))
 			: undefined;
 		this.config.debugState.lastContextMode = this.config.contextMode;
+		this.config.debugState.lastChainSignature = chainSignature;
 		this.config.debugState.lastSessionKey = sessionKey;
 		this.config.debugState.lastPreviousResponseId = previousResponseId;
 		this.config.debugState.lastRequestKeys = Object.keys(request).sort().join(',');
@@ -871,7 +875,7 @@ class CodexResponsesChatModel extends BaseChatModel {
 			if (!eventType) continue;
 
 			if (eventType === 'response.output_text.delta') {
-				const delta = toTrimmed(event.delta);
+				const delta = toStringValue(event.delta);
 				if (delta) text += delta;
 				continue;
 			}
@@ -884,7 +888,7 @@ class CodexResponsesChatModel extends BaseChatModel {
 					toolCallBuffers[idx] = {
 						id: toTrimmed(item.call_id) ?? toTrimmed(item.id) ?? randomUUID(),
 						name: toTrimmed(item.name) ?? 'tool',
-						argumentsRaw: toTrimmed(item.arguments) ?? '',
+						argumentsRaw: toStringValue(item.arguments) ?? '',
 					};
 				}
 				continue;
@@ -892,7 +896,7 @@ class CodexResponsesChatModel extends BaseChatModel {
 
 			if (eventType === 'response.function_call_arguments.delta') {
 				const idx = event.output_index ?? 0;
-				const delta = toTrimmed(event.delta);
+				const delta = toStringValue(event.delta);
 				if (delta && toolCallBuffers[idx]) {
 					toolCallBuffers[idx].argumentsRaw += delta;
 				}
@@ -910,7 +914,7 @@ class CodexResponsesChatModel extends BaseChatModel {
 				streamedToolCalls.push({
 					id: callId,
 					name,
-					argumentsRaw: buffered?.argumentsRaw || toTrimmed(item.arguments) || '{}',
+					argumentsRaw: buffered?.argumentsRaw || toStringValue(item.arguments) || '{}',
 				});
 				continue;
 			}
@@ -921,6 +925,7 @@ class CodexResponsesChatModel extends BaseChatModel {
 		}
 
 		await this.persistPreviousResponseId(finalResponse);
+		assertNoModelSubstitution(this.modelId, finalResponse);
 
 		const parsedOutput = parseCodexOutputItems(finalResponse?.output);
 		const mergedToolCalls = new Map<string, { id: string; name: string; argumentsRaw: string }>();
@@ -979,7 +984,7 @@ class CodexResponsesChatModel extends BaseChatModel {
 			if (!eventType) continue;
 
 			if (eventType === 'response.output_text.delta') {
-				const delta = toTrimmed(event.delta);
+				const delta = toStringValue(event.delta);
 				if (delta) {
 					yield { type: 'text-delta', delta };
 				}
@@ -987,7 +992,7 @@ class CodexResponsesChatModel extends BaseChatModel {
 			}
 
 			if (eventType === 'response.reasoning_summary_text.delta') {
-				const delta = toTrimmed(event.delta);
+				const delta = toStringValue(event.delta);
 				if (delta) {
 					yield { type: 'reasoning-delta', delta };
 				}
@@ -1002,7 +1007,7 @@ class CodexResponsesChatModel extends BaseChatModel {
 					toolCallBuffers[idx] = {
 						id: toTrimmed(item.call_id) ?? toTrimmed(item.id) ?? randomUUID(),
 						name: toTrimmed(item.name) ?? 'tool',
-						argumentsRaw: toTrimmed(item.arguments) ?? '',
+						argumentsRaw: toStringValue(item.arguments) ?? '',
 					};
 				}
 				continue;
@@ -1010,7 +1015,7 @@ class CodexResponsesChatModel extends BaseChatModel {
 
 			if (eventType === 'response.function_call_arguments.delta') {
 				const idx = event.output_index ?? 0;
-				const delta = toTrimmed(event.delta);
+				const delta = toStringValue(event.delta);
 				if (delta && toolCallBuffers[idx]) {
 					toolCallBuffers[idx].argumentsRaw += delta;
 				}
@@ -1025,18 +1030,19 @@ class CodexResponsesChatModel extends BaseChatModel {
 				const callId = toTrimmed(item.call_id) ?? buffered?.id;
 				const name = toTrimmed(item.name) ?? buffered?.name;
 				if (!callId || !name) continue;
-				yield {
-					type: 'tool-call-delta',
-					id: callId,
-					name,
-					argumentsDelta: buffered?.argumentsRaw || toTrimmed(item.arguments) || '{}',
-				};
+					yield {
+						type: 'tool-call-delta',
+						id: callId,
+						name,
+						argumentsDelta: buffered?.argumentsRaw || toStringValue(item.arguments) || '{}',
+					};
 				continue;
 			}
 
 			if (eventType === 'response.done' || eventType === 'response.completed') {
 				const response = toObject(event.response) as CodexResponsesResponse | undefined;
 				await this.persistPreviousResponseId(response);
+				assertNoModelSubstitution(this.modelId, response);
 				yield {
 					type: 'finish',
 					finishReason: 'stop',
@@ -1057,6 +1063,10 @@ function toTrimmed(value: unknown): string | undefined {
 	if (typeof value !== 'string') return undefined;
 	const trimmed = value.trim();
 	return trimmed || undefined;
+}
+
+function toStringValue(value: unknown): string | undefined {
+	return typeof value === 'string' ? value : undefined;
 }
 
 function toObject(value: unknown): Record<string, unknown> | undefined {
@@ -1348,11 +1358,15 @@ function normalizeSessionConversations(
 		const previousResponseId = toTrimmed(
 			stateObj.previousResponseId ?? stateObj.previous_response_id,
 		);
+		const requestSignature = toTrimmed(
+			stateObj.requestSignature ?? stateObj.request_signature,
+		);
 		const updatedAt = toTrimmed(stateObj.updatedAt ?? stateObj.updated_at);
-		if (!previousResponseId && !updatedAt) continue;
+		if (!previousResponseId && !updatedAt && !requestSignature) continue;
 
 		normalized[key] = {
 			...(previousResponseId ? { previousResponseId } : {}),
+			...(requestSignature ? { requestSignature } : {}),
 			...(updatedAt ? { updatedAt } : {}),
 		};
 	}
@@ -1878,6 +1892,7 @@ function buildModelRequestFailedError(
 		debugState?.lastRequestKeys ? `request_keys=${debugState.lastRequestKeys}` : undefined,
 		debugState?.lastReasoning ? `reasoning=${debugState.lastReasoning}` : undefined,
 		debugState?.lastContextMode ? `context_mode=${debugState.lastContextMode}` : undefined,
+		debugState?.lastChainSignature ? `chain_signature=${debugState.lastChainSignature}` : undefined,
 		debugState?.lastSessionKey ? `session_key=${debugState.lastSessionKey}` : undefined,
 		debugState?.lastPreviousResponseId
 			? `previous_response_id=${debugState.lastPreviousResponseId}`
@@ -2052,6 +2067,38 @@ function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
 
 function formatReasoningEffortList(efforts: ReadonlyArray<ModelReasoningEffort>): string {
 	return efforts.map((effort) => REASONING_EFFORT_LABEL[effort]).join(', ');
+}
+
+function buildChainRequestSignature(
+	modelName: string,
+	reasoning: CodexResponsesReasoning | undefined,
+): string {
+	const normalizedModel = normalizeModelName(modelName) ?? modelName.trim().toLowerCase();
+	const reasoningEffort = reasoning?.effort ?? 'none';
+	return `${normalizedModel}|${reasoningEffort}`;
+}
+
+function isModelSelectionCompatible(requestedModel: string, responseModel: string): boolean {
+	const requested = normalizeModelName(requestedModel);
+	const actual = normalizeModelName(responseModel);
+	if (!requested || !actual) return true;
+	if (requested === actual) return true;
+	if (actual.startsWith(`${requested}-`)) return true;
+	if (requested.startsWith(`${actual}-`)) return true;
+	return false;
+}
+
+function assertNoModelSubstitution(
+	requestedModel: string,
+	response: CodexResponsesResponse | undefined,
+): void {
+	const responseModel = toTrimmed(response?.model);
+	if (!responseModel) return;
+	if (isModelSelectionCompatible(requestedModel, responseModel)) return;
+
+	throw new ApplicationError(
+		`Model mismatch: requested "${requestedModel}", backend returned "${responseModel}". This backend substituted the model.`,
+	);
 }
 
 async function refreshChatgptTokens(
@@ -2266,24 +2313,36 @@ function resolveExplicitSessionKey(context: ISupplyDataFunctions): string | unde
 function getPreviousResponseIdForSession(
 	state: RuntimeNodeState,
 	sessionKey: string,
+	requestSignature: string,
 ): string | undefined {
 	const sessionState = state.sessionConversations?.[sessionKey];
-	return toTrimmed(sessionState?.previousResponseId);
+	const previousResponseId = toTrimmed(sessionState?.previousResponseId);
+	if (!previousResponseId) return undefined;
+
+	const storedSignature = toTrimmed(sessionState?.requestSignature);
+	if (!storedSignature || storedSignature !== requestSignature) {
+		return undefined;
+	}
+
+	return previousResponseId;
 }
 
 function upsertSessionConversationState(
 	state: RuntimeNodeState,
 	sessionKey: string,
 	previousResponseId: string,
+	requestSignature: string,
 ): RuntimeNodeState {
 	const normalizedResponseId = toTrimmed(previousResponseId);
-	if (!normalizedResponseId) return state;
+	const normalizedRequestSignature = toTrimmed(requestSignature);
+	if (!normalizedResponseId || !normalizedRequestSignature) return state;
 
 	const currentConversations = state.sessionConversations ?? {};
 	const nextConversations: Record<string, SessionConversationState> = {
 		...currentConversations,
 		[sessionKey]: {
 			previousResponseId: normalizedResponseId,
+			requestSignature: normalizedRequestSignature,
 			updatedAt: new Date().toISOString(),
 		},
 	};
@@ -2599,6 +2658,7 @@ export class OpenAiCodexChatModel implements INodeType {
 
 			const { selectedModel, modelName } = resolveConfiguredModelName(this);
 			const reasoningConfig = resolveReasoningConfig(this, selectedModel, modelName);
+			const chainRequestSignature = buildChainRequestSignature(modelName, reasoningConfig);
 			const contextMode = resolveContextMode(this);
 			const explicitSessionKey =
 				contextMode === 'chain_only' ? resolveExplicitSessionKey(this) : undefined;
@@ -2610,11 +2670,16 @@ export class OpenAiCodexChatModel implements INodeType {
 			}
 			const latestState = await loadNodeState(stateContext, runtimeStateKey, nodeStaticData);
 			const previousResponseId = contextMode === 'chain_only' && explicitSessionKey
-				? getPreviousResponseIdForSession(latestState, explicitSessionKey)
+				? getPreviousResponseIdForSession(
+						latestState,
+						explicitSessionKey,
+						chainRequestSignature,
+					)
 				: undefined;
 			const boundToolsDebugState: BoundToolsDebugState = {
 				toolNames: [],
 				lastContextMode: contextMode,
+				lastChainSignature: chainRequestSignature,
 				lastSessionKey: explicitSessionKey,
 				lastPreviousResponseId: previousResponseId,
 			};
@@ -2640,11 +2705,12 @@ export class OpenAiCodexChatModel implements INodeType {
 								runtimeStateKey,
 								nodeStaticData,
 							);
-							const updatedState = upsertSessionConversationState(
-								currentState,
-								sessionKey,
-								responseId,
-							);
+								const updatedState = upsertSessionConversationState(
+									currentState,
+									sessionKey,
+									responseId,
+									chainRequestSignature,
+								);
 							await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, updatedState);
 						}
 					: undefined,
