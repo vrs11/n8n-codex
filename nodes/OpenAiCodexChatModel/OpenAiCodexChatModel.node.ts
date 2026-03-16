@@ -77,10 +77,15 @@ type DeviceCodePollSuccess = {
 
 type AuthRequestContext = Pick<ISupplyDataFunctions, 'helpers'>;
 
+type SessionConversationState = {
+	previousResponseId?: string;
+	updatedAt?: string;
+};
+
 type RuntimeNodeState = {
 	codexAuthJson?: CodexAuthJson;
 	codexDeviceAuth?: DeviceCodeState;
-	conversationId?: string;
+	sessionConversations?: Record<string, SessionConversationState>;
 };
 
 type RuntimeStateContext = {
@@ -98,9 +103,13 @@ type BoundToolsDebugState = {
 	lastModel?: string;
 	lastRequestKeys?: string;
 	lastReasoning?: string;
+	lastContextMode?: ContextMode;
+	lastSessionKey?: string;
+	lastPreviousResponseId?: string;
 };
 
 type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+type ContextMode = 'memory_only' | 'chain_only';
 
 type ModelReasoningEffort = Exclude<CodexReasoningEffort, 'none'>;
 
@@ -203,13 +212,6 @@ const ALL_REASONING_EFFORTS: ReadonlyArray<ModelReasoningEffort> = [
 	'high',
 	'xhigh',
 ];
-const REASONING_EFFORT_RANK: Readonly<Record<ModelReasoningEffort, number>> = {
-	minimal: 1,
-	low: 2,
-	medium: 3,
-	high: 4,
-	xhigh: 5,
-};
 const REASONING_EFFORT_LABEL: Readonly<Record<CodexReasoningEffort, string>> = {
 	none: 'None',
 	minimal: 'Minimal',
@@ -219,22 +221,37 @@ const REASONING_EFFORT_LABEL: Readonly<Record<CodexReasoningEffort, string>> = {
 	xhigh: 'Extreme',
 };
 
-const MODELS_REASONING_LMHX: ReadonlyArray<string> = [
-	'gpt-5.3-codex',
-	'gpt-5.4',
-	'gpt-5.2-codex',
-	'gpt-5.1-codex-max',
-	'gpt-5.2',
+const REASONING_SET_LMHX: ReadonlyArray<ModelReasoningEffort> = ['low', 'medium', 'high', 'xhigh'];
+const REASONING_SET_LMH: ReadonlyArray<ModelReasoningEffort> = ['low', 'medium', 'high'];
+const REASONING_SET_MH: ReadonlyArray<ModelReasoningEffort> = ['medium', 'high'];
+const REASONING_SET_MINIMAL_LMH: ReadonlyArray<ModelReasoningEffort> = [
+	'minimal',
+	'low',
+	'medium',
+	'high',
 ];
-const MODELS_REASONING_LMH: ReadonlyArray<string> = [
-	'gpt-5.1-codex',
-	'gpt-5.1',
-	'gpt-5-codex',
-	'gpt-oss-120b',
-	'gpt-oss-20b',
-];
-const MODELS_REASONING_MH: ReadonlyArray<string> = ['gpt-5.1-codex-mini', 'gpt-5-codex-mini'];
-const MODELS_REASONING_MINIMAL_LMH: ReadonlyArray<string> = ['gpt-5'];
+
+function sameEffortSet(
+	current: ReadonlyArray<ModelReasoningEffort>,
+	target: ReadonlyArray<ModelReasoningEffort>,
+): boolean {
+	return (
+		current.length === target.length &&
+		current.every((value, index) => value === target[index])
+	);
+}
+
+function modelsForEffortSet(target: ReadonlyArray<ModelReasoningEffort>): ReadonlyArray<string> {
+	return Object.entries(MODEL_REASONING_EFFORTS)
+		.filter(([, efforts]) => sameEffortSet(efforts, target))
+		.map(([model]) => model);
+}
+
+const MODELS_REASONING_LMHX: ReadonlyArray<string> = modelsForEffortSet(REASONING_SET_LMHX);
+const MODELS_REASONING_LMH: ReadonlyArray<string> = modelsForEffortSet(REASONING_SET_LMH);
+const MODELS_REASONING_MH: ReadonlyArray<string> = modelsForEffortSet(REASONING_SET_MH);
+const MODELS_REASONING_MINIMAL_LMH: ReadonlyArray<string> =
+	modelsForEffortSet(REASONING_SET_MINIMAL_LMH);
 
 function reasoningEffortOptions(
 	supported: ReadonlyArray<ModelReasoningEffort>,
@@ -246,16 +263,41 @@ function reasoningEffortOptions(
 	}));
 }
 
-const REASONING_OPTIONS_LMHX = reasoningEffortOptions(['low', 'medium', 'high', 'xhigh']);
-const REASONING_OPTIONS_LMH = reasoningEffortOptions(['low', 'medium', 'high']);
-const REASONING_OPTIONS_MH = reasoningEffortOptions(['medium', 'high']);
-const REASONING_OPTIONS_MINIMAL_LMH = reasoningEffortOptions([
-	'minimal',
-	'low',
-	'medium',
-	'high',
-]);
+const REASONING_OPTIONS_LMHX = reasoningEffortOptions(REASONING_SET_LMHX);
+const REASONING_OPTIONS_LMH = reasoningEffortOptions(REASONING_SET_LMH);
+const REASONING_OPTIONS_MH = reasoningEffortOptions(REASONING_SET_MH);
+const REASONING_OPTIONS_MINIMAL_LMH = reasoningEffortOptions(REASONING_SET_MINIMAL_LMH);
 const REASONING_OPTIONS_CUSTOM = reasoningEffortOptions(ALL_REASONING_EFFORTS);
+
+function assertModelMetadataConsistency(): void {
+	const configuredModels = new Set(
+		MODEL_OPTIONS.map((option) => String(option.value).trim().toLowerCase()).filter(
+			(value) => value !== '__custom__',
+		),
+	);
+
+	const reasoningModels = new Set(Object.keys(MODEL_REASONING_EFFORTS));
+	const parallelModels = new Set(Object.keys(MODEL_SUPPORTS_PARALLEL_TOOL_CALLS));
+
+	const missingReasoning = [...configuredModels].filter((model) => !reasoningModels.has(model));
+	const missingParallel = [...configuredModels].filter((model) => !parallelModels.has(model));
+
+	if (missingReasoning.length > 0 || missingParallel.length > 0) {
+		const issues = [
+			missingReasoning.length > 0
+				? `missing reasoning profile for: ${missingReasoning.join(', ')}`
+				: undefined,
+			missingParallel.length > 0
+				? `missing parallel_tool_calls profile for: ${missingParallel.join(', ')}`
+				: undefined,
+		]
+			.filter(Boolean)
+			.join('; ');
+		throw new ApplicationError(`OpenAI codex model metadata mismatch: ${issues}`);
+	}
+}
+
+assertModelMetadataConsistency();
 
 function resolveReasoningEffortParameterName(modelName: string | undefined): string {
 	const normalized = normalizeModelName(modelName);
@@ -290,7 +332,9 @@ const DIRECT_PERSIST_DIR_ENV = 'N8N_OPENAI_CODEX_STATE_DIR';
 const ALLOW_PARALLEL_TOOL_CALLS =
 	toTrimmed(process.env.N8N_OPENAI_CODEX_ALLOW_PARALLEL_TOOLS) === 'true';
 const DEFAULT_INSTRUCTIONS = 'You are Codex.';
-const REQUEST_NORMALIZER_VERSION = '2026-03-16.6';
+const DEFAULT_CONTEXT_MODE: ContextMode = 'memory_only';
+const MAX_EXPLICIT_SESSION_KEY_LENGTH = 512;
+const REQUEST_NORMALIZER_VERSION = '2026-03-16.8';
 
 type CodexResponsesMessageContentItem = {
 	type: 'input_text' | 'output_text';
@@ -339,6 +383,7 @@ type CodexResponsesRequest = {
 	store: false;
 	include: string[];
 	prompt_cache_key: string;
+	previous_response_id?: string;
 	reasoning?: CodexResponsesReasoning;
 };
 
@@ -386,11 +431,14 @@ type CodexOpenStreamRequest = (
 
 type CodexResponsesChatModelConfig = {
 	baseUrl: string;
-	defaultHeaders: Record<string, string>;
+	baseHeaders: Record<string, string>;
+	contextMode: ContextMode;
 	defaultInstructions: string;
 	reasoning?: CodexResponsesReasoning;
 	parallelToolCalls: boolean;
-	promptCacheKey: string;
+	sessionKey?: string;
+	previousResponseId?: string;
+	savePreviousResponseId?: (sessionKey: string, responseId: string) => Promise<void>;
 	chatgptAccountId: string;
 	openStreamRequest: CodexOpenStreamRequest;
 	debugState: BoundToolsDebugState;
@@ -687,14 +735,29 @@ function normalizeCodexToolParameters(rawSchema: unknown): Record<string, unknow
 }
 
 class CodexResponsesChatModel extends BaseChatModel {
+	private previousResponseId: string | undefined;
+
 	constructor(
 		modelId: string,
 		private readonly config: CodexResponsesChatModelConfig,
 	) {
 		super('openai-codex', modelId);
+		this.previousResponseId = toTrimmed(config.previousResponseId);
 	}
 
-	private buildRequest(messages: Message[]): CodexResponsesRequest {
+	private getRequestTraceId(): string {
+		return toTrimmed(this.config.sessionKey) ?? randomUUID();
+	}
+
+	private buildRequestHeaders(requestTraceId: string): Record<string, string> {
+		return {
+			...this.config.baseHeaders,
+			'x-client-request-id': requestTraceId,
+			session_id: requestTraceId,
+		};
+	}
+
+	private buildRequest(messages: Message[], requestTraceId: string): CodexResponsesRequest {
 		const tools: CodexResponsesTool[] = [];
 		for (const tool of this.tools) {
 			const normalizedTool = codexToolFromGenericTool(tool);
@@ -704,6 +767,8 @@ class CodexResponsesChatModel extends BaseChatModel {
 
 		const { instructions, input } = toCodexInput(messages);
 		const include = this.config.reasoning ? ['reasoning.encrypted_content'] : [];
+		const sessionKey = toTrimmed(this.config.sessionKey);
+		const promptCacheKey = sessionKey ?? requestTraceId;
 
 		const request: CodexResponsesRequest = {
 			model: this.modelId,
@@ -715,9 +780,13 @@ class CodexResponsesChatModel extends BaseChatModel {
 			stream: true,
 			store: false,
 			include,
-			prompt_cache_key: this.config.promptCacheKey,
+			prompt_cache_key: promptCacheKey,
 			...(this.config.reasoning ? { reasoning: this.config.reasoning } : {}),
 		};
+		const previousResponseId = toTrimmed(this.previousResponseId);
+		if (this.config.contextMode === 'chain_only' && sessionKey && previousResponseId) {
+			request.previous_response_id = previousResponseId;
+		}
 
 		this.config.debugState.toolNames = tools.map((tool) => tool.name);
 		this.config.debugState.lastModel = this.modelId;
@@ -728,16 +797,38 @@ class CodexResponsesChatModel extends BaseChatModel {
 		this.config.debugState.lastReasoning = this.config.reasoning
 			? truncateErrorValue(JSON.stringify(this.config.reasoning))
 			: undefined;
+		this.config.debugState.lastContextMode = this.config.contextMode;
+		this.config.debugState.lastSessionKey = sessionKey;
+		this.config.debugState.lastPreviousResponseId = previousResponseId;
 		this.config.debugState.lastRequestKeys = Object.keys(request).sort().join(',');
 		setInputDebugState(request.input, this.config.debugState);
 
 		return request;
 	}
 
+	private async persistPreviousResponseId(response: CodexResponsesResponse | undefined): Promise<void> {
+		if (this.config.contextMode !== 'chain_only') return;
+
+		const sessionKey = toTrimmed(this.config.sessionKey);
+		const responseId = toTrimmed(response?.id);
+		if (!sessionKey || !responseId) return;
+
+		this.previousResponseId = responseId;
+		this.config.debugState.lastPreviousResponseId = responseId;
+
+		if (this.config.savePreviousResponseId) {
+			await this.config.savePreviousResponseId(sessionKey, responseId);
+		}
+	}
+
 	private async openResponsesStream(
 		request: CodexResponsesRequest,
+		requestTraceId: string,
 	): Promise<AsyncIterableIterator<Buffer | Uint8Array>> {
-		const response = await this.config.openStreamRequest(request, this.config.defaultHeaders);
+		const response = await this.config.openStreamRequest(
+			request,
+			this.buildRequestHeaders(requestTraceId),
+		);
 
 		if (response.statusCode < 200 || response.statusCode > 299) {
 			const errorPayload = {
@@ -766,8 +857,9 @@ class CodexResponsesChatModel extends BaseChatModel {
 	}
 
 	async generate(messages: Message[]): Promise<GenerateResult> {
-		const request = this.buildRequest(messages);
-		const stream = await this.openResponsesStream(request);
+		const requestTraceId = this.getRequestTraceId();
+		const request = this.buildRequest(messages, requestTraceId);
+		const stream = await this.openResponsesStream(request, requestTraceId);
 
 		let text = '';
 		const streamedToolCalls: Array<{ id: string; name: string; argumentsRaw: string }> = [];
@@ -828,6 +920,8 @@ class CodexResponsesChatModel extends BaseChatModel {
 			}
 		}
 
+		await this.persistPreviousResponseId(finalResponse);
+
 		const parsedOutput = parseCodexOutputItems(finalResponse?.output);
 		const mergedToolCalls = new Map<string, { id: string; name: string; argumentsRaw: string }>();
 		for (const toolCall of streamedToolCalls) {
@@ -875,8 +969,9 @@ class CodexResponsesChatModel extends BaseChatModel {
 	}
 
 	async *stream(messages: Message[]): AsyncIterable<StreamChunk> {
-		const request = this.buildRequest(messages);
-		const stream = await this.openResponsesStream(request);
+		const requestTraceId = this.getRequestTraceId();
+		const request = this.buildRequest(messages, requestTraceId);
+		const stream = await this.openResponsesStream(request, requestTraceId);
 		const toolCallBuffers: Record<number, { id: string; name: string; argumentsRaw: string }> = {};
 
 		for await (const event of parseCodexStreamEvents(stream)) {
@@ -941,6 +1036,7 @@ class CodexResponsesChatModel extends BaseChatModel {
 
 			if (eventType === 'response.done' || eventType === 'response.completed') {
 				const response = toObject(event.response) as CodexResponsesResponse | undefined;
+				await this.persistPreviousResponseId(response);
 				yield {
 					type: 'finish',
 					finishReason: 'stop',
@@ -1154,6 +1250,15 @@ function getRuntimeState(key: string): RuntimeNodeState {
 	return runtimeNodeState.get(key) ?? {};
 }
 
+function hasSessionConversations(state: RuntimeNodeState): boolean {
+	const sessions = state.sessionConversations;
+	return Boolean(sessions && Object.keys(sessions).length > 0);
+}
+
+function hasRuntimeState(state: RuntimeNodeState): boolean {
+	return Boolean(state.codexAuthJson || state.codexDeviceAuth || hasSessionConversations(state));
+}
+
 function setRuntimeAuthState(key: string, auth: CodexAuthJson | undefined): void {
 	const current = getRuntimeState(key);
 	if (auth) {
@@ -1162,7 +1267,7 @@ function setRuntimeAuthState(key: string, auth: CodexAuthJson | undefined): void
 		delete current.codexAuthJson;
 	}
 
-	if (current.codexAuthJson || current.codexDeviceAuth) {
+	if (hasRuntimeState(current)) {
 		runtimeNodeState.set(key, current);
 	} else {
 		runtimeNodeState.delete(key);
@@ -1177,7 +1282,25 @@ function setRuntimeDeviceState(key: string, state: DeviceCodeState | undefined):
 		delete current.codexDeviceAuth;
 	}
 
-	if (current.codexAuthJson || current.codexDeviceAuth) {
+	if (hasRuntimeState(current)) {
+		runtimeNodeState.set(key, current);
+	} else {
+		runtimeNodeState.delete(key);
+	}
+}
+
+function setRuntimeSessionConversations(
+	key: string,
+	sessionConversations: Record<string, SessionConversationState> | undefined,
+): void {
+	const current = getRuntimeState(key);
+	if (sessionConversations && Object.keys(sessionConversations).length > 0) {
+		current.sessionConversations = { ...sessionConversations };
+	} else {
+		delete current.sessionConversations;
+	}
+
+	if (hasRuntimeState(current)) {
 		runtimeNodeState.set(key, current);
 	} else {
 		runtimeNodeState.delete(key);
@@ -1209,6 +1332,34 @@ function getSystemErrorCode(error: unknown): string | undefined {
 	return toTrimmed(toObject(error)?.code);
 }
 
+function normalizeSessionConversations(
+	value: unknown,
+): Record<string, SessionConversationState> | undefined {
+	const parsed = toObject(value);
+	if (!parsed) return undefined;
+
+	const normalized: Record<string, SessionConversationState> = {};
+	for (const [rawKey, rawState] of Object.entries(parsed)) {
+		const key = toTrimmed(rawKey);
+		if (!key) continue;
+		const stateObj = toObject(rawState);
+		if (!stateObj) continue;
+
+		const previousResponseId = toTrimmed(
+			stateObj.previousResponseId ?? stateObj.previous_response_id,
+		);
+		const updatedAt = toTrimmed(stateObj.updatedAt ?? stateObj.updated_at);
+		if (!previousResponseId && !updatedAt) continue;
+
+		normalized[key] = {
+			...(previousResponseId ? { previousResponseId } : {}),
+			...(updatedAt ? { updatedAt } : {}),
+		};
+	}
+
+	return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
 function normalizePersistedState(value: unknown): RuntimeNodeState {
 	const parsed = toObject(value);
 	if (!parsed) return {};
@@ -1221,6 +1372,11 @@ function normalizePersistedState(value: unknown): RuntimeNodeState {
 	const deviceState = normalizeDeviceCodeState(parsed.codexDeviceAuth);
 	if (deviceState) {
 		state.codexDeviceAuth = deviceState;
+	}
+
+	const sessionConversations = normalizeSessionConversations(parsed.sessionConversations);
+	if (sessionConversations) {
+		state.sessionConversations = sessionConversations;
 	}
 
 	return state;
@@ -1262,6 +1418,10 @@ async function writePersistedState(
 		payload.codexDeviceAuth = { ...state.codexDeviceAuth } as unknown as IDataObject;
 	}
 
+	if (state.sessionConversations && Object.keys(state.sessionConversations).length > 0) {
+		payload.sessionConversations = state.sessionConversations as unknown as IDataObject;
+	}
+
 	try {
 		await mkdir(dirname(filePath), { recursive: true });
 		const tempPath = `${filePath}.tmp`;
@@ -1288,10 +1448,16 @@ async function loadNodeState(
 		persistedState.codexDeviceAuth ??
 		nodeStaticData.codexDeviceAuth ??
 		runtimeState.codexDeviceAuth;
+	const sessionConversationsRaw =
+		persistedState.sessionConversations ??
+		nodeStaticData.sessionConversations ??
+		runtimeState.sessionConversations;
+	const sessionConversations = normalizeSessionConversations(sessionConversationsRaw);
 
 	return {
 		codexAuthJson: authRaw ? normalizeAuthJson(authRaw) : undefined,
 		codexDeviceAuth: normalizeDeviceCodeState(deviceRaw),
+		sessionConversations,
 	};
 }
 
@@ -1313,8 +1479,15 @@ async function saveNodeState(
 		delete nodeStaticData.codexDeviceAuth;
 	}
 
+	if (state.sessionConversations && Object.keys(state.sessionConversations).length > 0) {
+		nodeStaticData.sessionConversations = state.sessionConversations as unknown as IDataObject;
+	} else {
+		delete nodeStaticData.sessionConversations;
+	}
+
 	setRuntimeAuthState(runtimeStateKey, state.codexAuthJson);
 	setRuntimeDeviceState(runtimeStateKey, state.codexDeviceAuth);
+	setRuntimeSessionConversations(runtimeStateKey, state.sessionConversations);
 
 	await writePersistedState(context, state);
 }
@@ -1528,12 +1701,10 @@ function buildRefreshFailureMessage(body: unknown): string {
 		.join(' ');
 }
 
-function resolveDefaultHeaders(chatgptAccountId: string, conversationId: string): Record<string, string> {
+function resolveDefaultHeaders(chatgptAccountId: string): Record<string, string> {
 	const headers: Record<string, string> = {
 		originator: DEFAULT_ORIGINATOR,
 		'chatgpt-account-id': chatgptAccountId,
-		'x-client-request-id': conversationId,
-		session_id: conversationId,
 		version: CODEX_NODE_VERSION,
 		'User-Agent': CODEX_USER_AGENT,
 	};
@@ -1550,12 +1721,6 @@ function resolveDefaultHeaders(chatgptAccountId: string, conversationId: string)
 	}
 
 	return headers;
-}
-
-function resolveConversationId(state: RuntimeNodeState): string {
-	const existing = toTrimmed(state.conversationId);
-	if (existing) return existing;
-	return randomUUID();
 }
 
 function getErrorStatus(error: unknown): number | undefined {
@@ -1712,6 +1877,11 @@ function buildModelRequestFailedError(
 		debugState?.lastInputPayload ? `input_payload=${debugState.lastInputPayload}` : undefined,
 		debugState?.lastRequestKeys ? `request_keys=${debugState.lastRequestKeys}` : undefined,
 		debugState?.lastReasoning ? `reasoning=${debugState.lastReasoning}` : undefined,
+		debugState?.lastContextMode ? `context_mode=${debugState.lastContextMode}` : undefined,
+		debugState?.lastSessionKey ? `session_key=${debugState.lastSessionKey}` : undefined,
+		debugState?.lastPreviousResponseId
+			? `previous_response_id=${debugState.lastPreviousResponseId}`
+			: undefined,
 		`normalizer_version=${REQUEST_NORMALIZER_VERSION}`,
 		`node_version=${CODEX_NODE_VERSION}`,
 		`chatgpt_account_id=${chatgptAccountId}`,
@@ -1861,37 +2031,27 @@ function setInputDebugState(input: unknown, debugState: BoundToolsDebugState): v
 	debugState.lastInputPayload = undefined;
 }
 
-function getModelReasoningEfforts(modelName: string | undefined): ReadonlyArray<ModelReasoningEffort> {
+function getModelReasoningEfforts(
+	modelName: string | undefined,
+): ReadonlyArray<ModelReasoningEffort> | undefined {
 	const normalized = normalizeModelName(modelName);
-	if (!normalized) return ALL_REASONING_EFFORTS;
-	return MODEL_REASONING_EFFORTS[normalized] ?? ALL_REASONING_EFFORTS;
+	if (!normalized) return undefined;
+	return MODEL_REASONING_EFFORTS[normalized];
 }
 
-function resolveReasoningEffortForModel(
-	modelName: string | undefined,
-	requestedEffort: CodexReasoningEffort,
-): CodexReasoningEffort {
-	if (requestedEffort === 'none') {
-		return 'none';
-	}
+function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
+	return (
+		value === 'none' ||
+		value === 'minimal' ||
+		value === 'low' ||
+		value === 'medium' ||
+		value === 'high' ||
+		value === 'xhigh'
+	);
+}
 
-	const supported = getModelReasoningEfforts(modelName);
-	if (supported.includes(requestedEffort)) {
-		return requestedEffort;
-	}
-
-	const requestedRank = REASONING_EFFORT_RANK[requestedEffort];
-	let closest: ModelReasoningEffort | undefined;
-	let closestDistance = Number.POSITIVE_INFINITY;
-	for (const effort of supported) {
-		const distance = Math.abs(REASONING_EFFORT_RANK[effort] - requestedRank);
-		if (distance < closestDistance) {
-			closestDistance = distance;
-			closest = effort;
-		}
-	}
-
-	return closest ?? DEFAULT_REASONING_EFFORT;
+function formatReasoningEffortList(efforts: ReadonlyArray<ModelReasoningEffort>): string {
+	return efforts.map((effort) => REASONING_EFFORT_LABEL[effort]).join(', ');
 }
 
 async function refreshChatgptTokens(
@@ -1973,13 +2133,11 @@ type ResolvedAuthState =
 	| {
 			status: 'pending';
 			deviceState: DeviceCodeState;
-			conversationId: string;
 			initiated: boolean;
 	  }
 	| {
 			status: 'authenticated';
 			auth: CodexAuthJson;
-			conversationId: string;
 	  };
 
 function shouldRefreshAuthTokens(auth: CodexAuthJson): boolean {
@@ -2007,7 +2165,6 @@ async function resolveNodeAuthState(
 	const loadedState = await loadNodeState(stateContext, runtimeStateKey, nodeStaticData);
 	let auth = loadedState.codexAuthJson;
 	let deviceState = loadedState.codexDeviceAuth;
-	const conversationId = resolveConversationId(loadedState);
 
 	if (!auth || !hasUsableAuthData(auth)) {
 		auth = undefined;
@@ -2017,12 +2174,11 @@ async function resolveNodeAuthState(
 			await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
 				codexAuthJson: undefined,
 				codexDeviceAuth: deviceState,
-				conversationId,
+				sessionConversations: loadedState.sessionConversations,
 			});
 			return {
 				status: 'pending',
 				deviceState,
-				conversationId,
 				initiated: true,
 			};
 		}
@@ -2040,12 +2196,11 @@ async function resolveNodeAuthState(
 			await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
 				codexAuthJson: undefined,
 				codexDeviceAuth: deviceState,
-				conversationId,
+				sessionConversations: loadedState.sessionConversations,
 			});
 			return {
 				status: 'pending',
 				deviceState,
-				conversationId,
 				initiated: false,
 			};
 		}
@@ -2060,7 +2215,7 @@ async function resolveNodeAuthState(
 		await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
 			codexAuthJson: auth,
 			codexDeviceAuth: undefined,
-			conversationId,
+			sessionConversations: loadedState.sessionConversations,
 		});
 	}
 
@@ -2075,13 +2230,12 @@ async function resolveNodeAuthState(
 	await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
 		codexAuthJson: auth,
 		codexDeviceAuth: undefined,
-		conversationId,
+		sessionConversations: loadedState.sessionConversations,
 	});
 
 	return {
 		status: 'authenticated',
 		auth,
-		conversationId,
 	};
 }
 
@@ -2089,6 +2243,55 @@ function buildPendingLoginMessage(deviceState: DeviceCodeState, initiated: boole
 	return initiated
 		? `Device login initiated. Open ${deviceState.verification_url} and enter code ${deviceState.user_code}. Then run this node again to verify login.`
 		: `Device login pending. Open ${deviceState.verification_url} and enter code ${deviceState.user_code}. Then run this node again.`;
+}
+
+function resolveContextMode(context: ISupplyDataFunctions): ContextMode {
+	const value = context.getNodeParameter('contextMode', 0, DEFAULT_CONTEXT_MODE) as string;
+	return value === 'chain_only' ? 'chain_only' : 'memory_only';
+}
+
+function resolveExplicitSessionKey(context: ISupplyDataFunctions): string | undefined {
+	const rawValue = context.getNodeParameter('sessionKey', 0, '') as string;
+	const sessionKey = toTrimmed(rawValue);
+	if (!sessionKey) return undefined;
+	if (sessionKey.length > MAX_EXPLICIT_SESSION_KEY_LENGTH) {
+		throw new NodeOperationError(
+			context.getNode(),
+			`Session Key exceeds ${MAX_EXPLICIT_SESSION_KEY_LENGTH} characters.`,
+		);
+	}
+	return sessionKey;
+}
+
+function getPreviousResponseIdForSession(
+	state: RuntimeNodeState,
+	sessionKey: string,
+): string | undefined {
+	const sessionState = state.sessionConversations?.[sessionKey];
+	return toTrimmed(sessionState?.previousResponseId);
+}
+
+function upsertSessionConversationState(
+	state: RuntimeNodeState,
+	sessionKey: string,
+	previousResponseId: string,
+): RuntimeNodeState {
+	const normalizedResponseId = toTrimmed(previousResponseId);
+	if (!normalizedResponseId) return state;
+
+	const currentConversations = state.sessionConversations ?? {};
+	const nextConversations: Record<string, SessionConversationState> = {
+		...currentConversations,
+		[sessionKey]: {
+			previousResponseId: normalizedResponseId,
+			updatedAt: new Date().toISOString(),
+		},
+	};
+
+	return {
+		...state,
+		sessionConversations: nextConversations,
+	};
 }
 
 function resolveConfiguredModelName(context: ISupplyDataFunctions): {
@@ -2126,17 +2329,34 @@ function resolveReasoningConfig(
 		) as CodexReasoningEffort;
 	}
 
-	const resolvedReasoningEffort = resolveReasoningEffortForModel(
-		modelName,
-		selectedReasoningEffort,
-	);
+	if (!isCodexReasoningEffort(selectedReasoningEffort)) {
+		throw new NodeOperationError(
+			context.getNode(),
+			`Invalid Reasoning Effort "${String(selectedReasoningEffort)}".`,
+		);
+	}
 
-	if (resolvedReasoningEffort === 'none') {
+	if (selectedReasoningEffort === 'none') {
 		return undefined;
 	}
 
+	const supportedEfforts = getModelReasoningEfforts(modelName);
+	if (!supportedEfforts) {
+		throw new NodeOperationError(
+			context.getNode(),
+			`Model "${modelName}" does not have a verified reasoning-effort profile. Select a listed model or set Reasoning Effort to None.`,
+		);
+	}
+
+	if (!supportedEfforts.includes(selectedReasoningEffort)) {
+		throw new NodeOperationError(
+			context.getNode(),
+			`Reasoning Effort "${REASONING_EFFORT_LABEL[selectedReasoningEffort]}" is not supported by model "${modelName}". Supported: ${formatReasoningEffortList(supportedEfforts)}.`,
+		);
+	}
+
 	return {
-		effort: resolvedReasoningEffort as ModelReasoningEffort,
+		effort: selectedReasoningEffort,
 		summary: 'auto',
 	};
 }
@@ -2204,6 +2424,41 @@ export class OpenAiCodexChatModel implements INodeType {
 					},
 				},
 				description: 'Custom model slug',
+			},
+			{
+				displayName: 'Context Mode',
+				name: 'contextMode',
+				type: 'options',
+				default: DEFAULT_CONTEXT_MODE,
+					options: [
+						{
+							name: 'Memory Only (N8N Memory)',
+							value: 'memory_only',
+							description:
+								'Do not use previous_response_id. Context is provided by n8n Agent/Memory.',
+						},
+						{
+							name: 'Backend Chain (Previous Response ID)',
+							value: 'chain_only',
+							description:
+								'Use previous_response_id chaining keyed by Session Key. Do not use Memory replay.',
+					},
+				],
+				description: 'Choose exactly one context strategy to avoid double-context behavior',
+			},
+			{
+				displayName: 'Session Key',
+				name: 'sessionKey',
+				type: 'string',
+				default: '',
+				placeholder: '={{ $json.sessionId }}',
+				displayOptions: {
+					show: {
+						contextMode: ['chain_only'],
+					},
+				},
+				description:
+					'Required for Backend Chain mode. Use a stable key (for example user ID or session ID) so previous_response_id chaining can continue.',
 			},
 			{
 				displayName: 'Reasoning Effort',
@@ -2297,7 +2552,7 @@ export class OpenAiCodexChatModel implements INodeType {
 					status: 'authenticated',
 					chatgpt_account_id: resolveAccountId(resolved.auth) ?? null,
 					last_refresh: toTrimmed(resolved.auth.last_refresh) ?? null,
-					conversation_id: resolved.conversationId,
+					conversation_id: null,
 				}),
 			];
 		} catch (error) {
@@ -2344,22 +2599,55 @@ export class OpenAiCodexChatModel implements INodeType {
 
 			const { selectedModel, modelName } = resolveConfiguredModelName(this);
 			const reasoningConfig = resolveReasoningConfig(this, selectedModel, modelName);
+			const contextMode = resolveContextMode(this);
+			const explicitSessionKey =
+				contextMode === 'chain_only' ? resolveExplicitSessionKey(this) : undefined;
+			if (contextMode === 'chain_only' && !explicitSessionKey) {
+				throw new NodeOperationError(
+					this.getNode(),
+					'Session Key is required when Context Mode is Backend Chain (previous_response_id).',
+				);
+			}
+			const latestState = await loadNodeState(stateContext, runtimeStateKey, nodeStaticData);
+			const previousResponseId = contextMode === 'chain_only' && explicitSessionKey
+				? getPreviousResponseIdForSession(latestState, explicitSessionKey)
+				: undefined;
 			const boundToolsDebugState: BoundToolsDebugState = {
 				toolNames: [],
+				lastContextMode: contextMode,
+				lastSessionKey: explicitSessionKey,
+				lastPreviousResponseId: previousResponseId,
 			};
-			const defaultHeaders = {
+			const baseHeaders = {
 				Authorization: `Bearer ${token}`,
 				Accept: 'text/event-stream',
-				...resolveDefaultHeaders(chatgptAccountId, resolved.conversationId),
+				...resolveDefaultHeaders(chatgptAccountId),
 			};
 
 			const codexModel = new CodexResponsesChatModel(modelName, {
 				baseUrl: DEFAULT_CHATGPT_CODEX_BASE_URL,
-				defaultHeaders,
+				baseHeaders,
+				contextMode,
 				defaultInstructions: DEFAULT_INSTRUCTIONS,
 				reasoning: reasoningConfig,
 				parallelToolCalls: supportsParallelToolCalls(modelName),
-				promptCacheKey: resolved.conversationId,
+				sessionKey: explicitSessionKey,
+				previousResponseId,
+				savePreviousResponseId: explicitSessionKey
+					? async (sessionKey: string, responseId: string) => {
+							const currentState = await loadNodeState(
+								stateContext,
+								runtimeStateKey,
+								nodeStaticData,
+							);
+							const updatedState = upsertSessionConversationState(
+								currentState,
+								sessionKey,
+								responseId,
+							);
+							await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, updatedState);
+						}
+					: undefined,
 				chatgptAccountId,
 				debugState: boundToolsDebugState,
 				openStreamRequest: async (request, headers) => {
