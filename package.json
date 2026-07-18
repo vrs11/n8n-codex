@@ -1,7 +1,7 @@
 {
 	"name": "n8n-nodes-openai-codex",
-	"version": "0.1.0",
-	"description": "n8n AI chat model node for ChatGPT Codex backend with built-in device code auth",
+	"version": "0.2.0",
+	"description": "n8n AI chat model node for the current ChatGPT Codex Responses backend",
 	"license": "MIT",
 	"keywords": [
 		"n8n-community-node-package",
@@ -35,11 +35,14 @@
 		]
 	},
 	"devDependencies": {
-		"@n8n/node-cli": "*",
+		"@n8n/ai-node-sdk": ">=0.20.3 <1",
+		"@n8n/node-cli": ">=0.39.3 <1",
 		"eslint": "9.32.0",
+		"n8n-workflow": ">=2.30.2 <3",
 		"prettier": "3.6.2",
 		"release-it": "^19.0.4",
-		"typescript": "5.9.2"
+		"typescript": "5.9.2",
+		"zod": "3.25.67"
 	},
 	"peerDependencies": {
 		"@n8n/ai-node-sdk": "*",

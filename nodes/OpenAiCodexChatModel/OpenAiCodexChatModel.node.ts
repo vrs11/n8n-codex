@@ -3,6 +3,7 @@ import {
 	getParametersJsonSchema,
 	parseSSEStream,
 	supplyModel,
+	type ChatModelConfig,
 	type GenerateResult,
 	type Message,
 	type MessageContent,
@@ -11,7 +12,7 @@ import {
 	type Tool,
 } from '@n8n/ai-node-sdk';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import packageJson from '../../package.json';
@@ -21,12 +22,13 @@ import type {
 	ILoadOptionsFunctions,
 	IN8nHttpFullResponse,
 	INodeExecutionData,
+	INode,
 	INodePropertyOptions,
 	INodeType,
 	INodeTypeDescription,
 	ISupplyDataFunctions,
 } from 'n8n-workflow';
-import { ApplicationError, NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
+import { NodeConnectionTypes, NodeOperationError, OperationalError } from 'n8n-workflow';
 
 type CodexAuthJson = {
 	OPENAI_API_KEY?: string | null;
@@ -78,21 +80,33 @@ type DeviceCodePollSuccess = {
 
 type AuthRequestContext = Pick<ISupplyDataFunctions, 'helpers'>;
 
-type SessionConversationState = {
-	previousResponseId?: string;
-	requestSignature?: string;
-	updatedAt?: string;
-};
-
 type PersistedModelInfo = {
 	slug: string;
 	displayName: string;
+	description?: string;
 	priority: number;
 	supportedInApi: boolean;
 	visibility: 'list' | 'hide' | 'none';
 	supportsParallelToolCalls: boolean;
-	supportedReasoningEfforts: ModelReasoningEffort[];
+	supportedReasoningEfforts: Array<{
+		effort: ModelReasoningEffort;
+		description?: string;
+	}>;
 	defaultReasoningEffort: CodexReasoningEffort;
+	supportsReasoningSummary: boolean;
+	defaultReasoningSummary: CodexReasoningSummary;
+	supportsVerbosity: boolean;
+	defaultVerbosity?: CodexVerbosity;
+	serviceTiers: ModelServiceTier[];
+	defaultServiceTier?: string;
+	useResponsesLite: boolean;
+	baseInstructions?: string;
+};
+
+type ModelServiceTier = {
+	id: string;
+	name: string;
+	description?: string;
 };
 
 type ModelsCatalogState = {
@@ -103,13 +117,12 @@ type ModelsCatalogState = {
 type RuntimeNodeState = {
 	codexAuthJson?: CodexAuthJson;
 	codexDeviceAuth?: DeviceCodeState;
-	sessionConversations?: Record<string, SessionConversationState>;
 	modelsCatalog?: ModelsCatalogState;
 };
 
 type RuntimeStateContext = {
 	getWorkflow: () => { id?: string | number | null };
-	getNode: () => { id?: string; name: string };
+	getNode: () => INode;
 };
 
 type BoundToolsDebugState = {
@@ -122,16 +135,12 @@ type BoundToolsDebugState = {
 	lastModel?: string;
 	lastRequestKeys?: string;
 	lastReasoning?: string;
-	lastContextMode?: ContextMode;
-	lastChainSignature?: string;
-	lastSessionKey?: string;
-	lastPreviousResponseId?: string;
 };
 
-type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
-type ContextMode = 'memory_only' | 'chain_only';
-
-type ModelReasoningEffort = Exclude<CodexReasoningEffort, 'none'>;
+type CodexReasoningEffort = 'default' | 'none' | ModelReasoningEffort;
+type ModelReasoningEffort = string;
+type CodexReasoningSummary = 'none' | 'auto' | 'concise' | 'detailed';
+type CodexVerbosity = 'low' | 'medium' | 'high';
 const CUSTOM_MODEL_VALUE = '__custom__';
 
 const MODEL_OPTIONS: INodePropertyOptions[] = [
@@ -140,56 +149,24 @@ const MODEL_OPTIONS: INodePropertyOptions[] = [
 		value: CUSTOM_MODEL_VALUE,
 	},
 	{
-		name: 'GPT-5.4',
-		value: 'gpt-5.4',
+		name: 'GPT-5.6-Sol',
+		value: 'gpt-5.6-sol',
 	},
 	{
-		name: 'GPT-5.3 Codex',
-		value: 'gpt-5.3-codex',
+		name: 'GPT-5.6-Terra',
+		value: 'gpt-5.6-terra',
+	},
+	{
+		name: 'GPT-5.6-Luna',
+		value: 'gpt-5.6-luna',
+	},
+	{
+		name: 'GPT-5.5',
+		value: 'gpt-5.5',
 	},
 	{
 		name: 'GPT-5.2',
 		value: 'gpt-5.2',
-	},
-	{
-		name: 'GPT-5.2 Codex',
-		value: 'gpt-5.2-codex',
-	},
-	{
-		name: 'GPT-5.1',
-		value: 'gpt-5.1',
-	},
-	{
-		name: 'GPT-5.1 Codex Max',
-		value: 'gpt-5.1-codex-max',
-	},
-	{
-		name: 'GPT-5.1 Codex',
-		value: 'gpt-5.1-codex',
-	},
-	{
-		name: 'GPT-5',
-		value: 'gpt-5',
-	},
-	{
-		name: 'GPT-5 Codex',
-		value: 'gpt-5-codex',
-	},
-	{
-		name: 'GPT-5.1 Codex Mini',
-		value: 'gpt-5.1-codex-mini',
-	},
-	{
-		name: 'GPT-5 Codex Mini',
-		value: 'gpt-5-codex-mini',
-	},
-	{
-		name: 'GPT-OSS 120B',
-		value: 'gpt-oss-120b',
-	},
-	{
-		name: 'GPT-OSS 20B',
-		value: 'gpt-oss-20b',
 	},
 ];
 
@@ -197,61 +174,48 @@ const FALLBACK_MODEL_NAME_BY_SLUG = new Map(
 	MODEL_OPTIONS.map((option) => [String(option.value).trim().toLowerCase(), option.name]),
 );
 
-const MODEL_SUPPORTS_PARALLEL_TOOL_CALLS: Readonly<Record<string, boolean>> = {
-	'gpt-5.3-codex': true,
-	'gpt-5.4': true,
-	'gpt-5.2-codex': true,
-	'gpt-5.1-codex-max': false,
-	'gpt-5.1-codex': false,
-	'gpt-5.2': true,
-	'gpt-5.1': true,
-	'gpt-5-codex': false,
-	'gpt-5-codex-mini': false,
-	'gpt-5.1-codex-mini': false,
-	'gpt-5': false,
-	'gpt-oss-120b': false,
-	'gpt-oss-20b': false,
-};
-
 const MODEL_REASONING_EFFORTS: Readonly<Record<string, ReadonlyArray<ModelReasoningEffort>>> = {
-	'gpt-5.3-codex': ['low', 'medium', 'high', 'xhigh'],
+	'gpt-5.6-sol': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+	'gpt-5.6-terra': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+	'gpt-5.6-luna': ['low', 'medium', 'high', 'xhigh', 'max'],
+	'gpt-5.5': ['low', 'medium', 'high', 'xhigh'],
 	'gpt-5.4': ['low', 'medium', 'high', 'xhigh'],
-	'gpt-5.2-codex': ['low', 'medium', 'high', 'xhigh'],
-	'gpt-5.1-codex-max': ['low', 'medium', 'high', 'xhigh'],
-	'gpt-5.1-codex': ['low', 'medium', 'high'],
+	'gpt-5.4-mini': ['low', 'medium', 'high', 'xhigh'],
 	'gpt-5.2': ['low', 'medium', 'high', 'xhigh'],
-	'gpt-5.1': ['low', 'medium', 'high'],
-	'gpt-5-codex': ['low', 'medium', 'high'],
-	'gpt-5': ['minimal', 'low', 'medium', 'high'],
-	'gpt-oss-120b': ['low', 'medium', 'high'],
-	'gpt-oss-20b': ['low', 'medium', 'high'],
-	'gpt-5.1-codex-mini': ['medium', 'high'],
-	'gpt-5-codex-mini': ['medium', 'high'],
 };
 
-const DEFAULT_REASONING_EFFORT: CodexReasoningEffort = 'medium';
+const DEFAULT_REASONING_EFFORT: CodexReasoningEffort = 'default';
 const ALL_REASONING_EFFORTS: ReadonlyArray<ModelReasoningEffort> = [
 	'minimal',
 	'low',
 	'medium',
 	'high',
 	'xhigh',
+	'max',
+	'ultra',
 ];
-const REASONING_EFFORT_LABEL: Readonly<Record<CodexReasoningEffort, string>> = {
-	none: 'None',
-	minimal: 'Minimal',
-	low: 'Low',
-	medium: 'Mid',
-	high: 'High',
-	xhigh: 'Extreme',
-};
+
+function reasoningEffortLabel(value: CodexReasoningEffort): string {
+	const labels: Readonly<Record<string, string>> = {
+		default: 'Model Default',
+		none: 'None',
+		minimal: 'Minimal',
+		low: 'Low',
+		medium: 'Medium',
+		high: 'High',
+		xhigh: 'Extra High',
+		max: 'Max',
+		ultra: 'Ultra',
+	};
+	return labels[value] ?? value;
+}
 
 function reasoningEffortOptions(
 	supported: ReadonlyArray<ModelReasoningEffort>,
 ): INodePropertyOptions[] {
-	const values: CodexReasoningEffort[] = ['none', ...supported];
+	const values: CodexReasoningEffort[] = ['default', 'none', ...supported];
 	return values.map((value) => ({
-		name: REASONING_EFFORT_LABEL[value],
+		name: reasoningEffortLabel(value),
 		value,
 	}));
 }
@@ -262,38 +226,44 @@ const runtimeNodeState = new Map<string, RuntimeNodeState>();
 
 const DEFAULT_CHATGPT_CODEX_BASE_URL = 'https://chatgpt.com/backend-api/codex';
 const DEFAULT_ORIGINATOR = 'codex_cli_rs';
-const CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
+const CODEX_CLIENT_ID =
+	toTrimmed(process.env.CODEX_APP_SERVER_LOGIN_CLIENT_ID) ?? 'app_EMoamEEZ73f0CkXaXp7hrann';
 const AUTH_ISSUER = 'https://auth.openai.com';
-const REFRESH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
+const REFRESH_TOKEN_URL =
+	toTrimmed(process.env.CODEX_REFRESH_TOKEN_URL_OVERRIDE) ?? 'https://auth.openai.com/oauth/token';
 const DEVICE_CODE_USERCODE_URL = `${AUTH_ISSUER}/api/accounts/deviceauth/usercode`;
 const DEVICE_CODE_TOKEN_URL = `${AUTH_ISSUER}/api/accounts/deviceauth/token`;
 const DEVICE_CODE_VERIFICATION_URL = `${AUTH_ISSUER}/codex/device`;
 const DEVICE_CODE_CALLBACK_URL = `${AUTH_ISSUER}/deviceauth/callback`;
-const DEFAULT_MODEL = 'gpt-5-codex';
+const DEFAULT_MODEL = 'gpt-5.6-sol';
 const TOKEN_REFRESH_INTERVAL_DAYS = 8;
 const DEVICE_CODE_EXPIRY_MS = 15 * 60 * 1000;
 const CODEX_NODE_VERSION = toTrimmed(packageJson.version) ?? '0.0.0';
-const MODELS_CLIENT_VERSION = toWholeSemver(CODEX_NODE_VERSION);
-const CODEX_USER_AGENT = `${DEFAULT_ORIGINATOR}/${CODEX_NODE_VERSION} (n8n-openai-codex)`;
+const MODELS_CLIENT_VERSION = toTrimmed(process.env.N8N_OPENAI_CODEX_CLIENT_VERSION) ?? '0.145.0';
+const CODEX_USER_AGENT = `${DEFAULT_ORIGINATOR}/${MODELS_CLIENT_VERSION} (n8n-openai-codex/${CODEX_NODE_VERSION})`;
 const PERSISTED_STATE_PREFIX = '.openai-codex-state';
 const DIRECT_PERSIST_DIR_ENV = 'N8N_OPENAI_CODEX_STATE_DIR';
 const ALLOW_PARALLEL_TOOL_CALLS =
-	toTrimmed(process.env.N8N_OPENAI_CODEX_ALLOW_PARALLEL_TOOLS) === 'true';
+	toTrimmed(process.env.N8N_OPENAI_CODEX_ALLOW_PARALLEL_TOOLS) !== 'false';
 const MODEL_CATALOG_CACHE_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_INSTRUCTIONS = 'You are Codex.';
-const DEFAULT_CONTEXT_MODE: ContextMode = 'memory_only';
-const MAX_EXPLICIT_SESSION_KEY_LENGTH = 512;
-const REQUEST_NORMALIZER_VERSION = '2026-03-16.8';
+const REQUEST_NORMALIZER_VERSION = '2026-07-18.1';
 
-type CodexResponsesMessageContentItem = {
-	type: 'input_text' | 'output_text';
-	text: string;
-};
+type CodexResponsesMessageContentItem =
+	| {
+			type: 'input_text' | 'output_text';
+			text: string;
+	  }
+	| {
+			type: 'input_image';
+			image_url: string;
+			detail?: 'auto';
+	  };
 
 type CodexResponsesInputItem =
 	| {
 			type: 'message';
-			role: 'user' | 'assistant';
+			role: 'user' | 'assistant' | 'developer';
 			content: CodexResponsesMessageContentItem[];
 	  }
 	| {
@@ -306,6 +276,11 @@ type CodexResponsesInputItem =
 			type: 'function_call_output';
 			call_id: string;
 			output: string;
+	  }
+	| {
+			type: 'additional_tools';
+			role: 'developer';
+			tools: CodexResponsesTool[];
 	  };
 
 type CodexResponsesTool = {
@@ -317,23 +292,26 @@ type CodexResponsesTool = {
 };
 
 type CodexResponsesReasoning = {
-	effort: ModelReasoningEffort;
-	summary: 'auto';
+	effort?: ModelReasoningEffort;
+	summary?: Exclude<CodexReasoningSummary, 'none'>;
+	context?: 'all_turns';
 };
 
 type CodexResponsesRequest = {
 	model: string;
-	instructions: string;
+	instructions?: string;
 	input: CodexResponsesInputItem[];
-	tools: CodexResponsesTool[];
+	tools?: CodexResponsesTool[];
 	tool_choice: 'auto';
 	parallel_tool_calls: boolean;
 	stream: true;
 	store: false;
 	include: string[];
 	prompt_cache_key: string;
-	previous_response_id?: string;
 	reasoning?: CodexResponsesReasoning;
+	service_tier?: string;
+	text?: { verbosity: CodexVerbosity };
+	client_metadata: Record<string, string>;
 };
 
 type CodexResponsesOutputItem = {
@@ -350,8 +328,11 @@ type CodexResponsesResponse = {
 	object?: string;
 	created_at?: string;
 	model?: string;
+	headers?: Record<string, unknown>;
 	output?: CodexResponsesOutputItem[];
 	status?: string;
+	error?: { message?: string; code?: string };
+	incomplete_details?: { reason?: string };
 	usage?: {
 		input_tokens?: number;
 		output_tokens?: number;
@@ -367,6 +348,7 @@ type CodexResponsesResponse = {
 
 type CodexStreamEvent = {
 	type?: string;
+	headers?: Record<string, unknown>;
 	delta?: string;
 	output_index?: number;
 	item?: Record<string, unknown>;
@@ -376,24 +358,26 @@ type CodexStreamEvent = {
 type CodexOpenStreamRequest = (
 	request: CodexResponsesRequest,
 	headers: Record<string, string>,
+	config?: ChatModelConfig,
 ) => Promise<IN8nHttpFullResponse>;
 
 type CodexResponsesChatModelConfig = {
-	baseUrl: string;
 	baseHeaders: Record<string, string>;
-	contextMode: ContextMode;
 	defaultInstructions: string;
 	reasoning?: CodexResponsesReasoning;
+	serviceTier?: string;
+	verbosity?: CodexVerbosity;
 	parallelToolCalls: boolean;
-	sessionKey?: string;
-	previousResponseId?: string;
-	savePreviousResponseId?: (sessionKey: string, responseId: string) => Promise<void>;
+	useResponsesLite: boolean;
+	refreshAuthHeaders: () => Promise<Record<string, string>>;
 	chatgptAccountId: string;
 	openStreamRequest: CodexOpenStreamRequest;
 	debugState: BoundToolsDebugState;
 };
 
-function isAsyncBufferIterable(value: unknown): value is AsyncIterableIterator<Buffer | Uint8Array> {
+function isAsyncBufferIterable(
+	value: unknown,
+): value is AsyncIterableIterator<Buffer | Uint8Array> {
 	return (
 		Boolean(value) &&
 		typeof value === 'object' &&
@@ -437,6 +421,24 @@ function parseCodexTokenUsage(usage: CodexResponsesResponse['usage']): TokenUsag
 					}
 				: undefined,
 	};
+}
+
+function getReportedModelFromHeaders(headers: unknown): string | undefined {
+	const values = toObject(headers);
+	if (!values) return undefined;
+	for (const [name, value] of Object.entries(values)) {
+		const normalizedName = name.toLowerCase();
+		if (normalizedName !== 'openai-model' && normalizedName !== 'x-openai-model') continue;
+		return toTrimmed(value);
+	}
+	return undefined;
+}
+
+function getReportedModelFromEvent(event: CodexStreamEvent): string | undefined {
+	return (
+		getReportedModelFromHeaders(event.response?.headers) ??
+		getReportedModelFromHeaders(event.headers)
+	);
 }
 
 function parseToolCallArguments(raw: string): Record<string, unknown> {
@@ -509,6 +511,28 @@ function toCodexOutputText(part: MessageContent): string | undefined {
 	return undefined;
 }
 
+function toCodexInputMedia(part: MessageContent): CodexResponsesMessageContentItem | undefined {
+	if (part.type !== 'file') return undefined;
+
+	const mediaType = toTrimmed(part.mediaType)?.toLowerCase();
+	if (mediaType?.startsWith('audio/')) {
+		return {
+			type: 'input_text',
+			text: 'Codex does not support audio input yet.',
+		};
+	}
+	if (!mediaType?.startsWith('image/')) return undefined;
+
+	const rawData =
+		typeof part.data === 'string' ? part.data : Buffer.from(part.data).toString('base64');
+	const imageUrl = rawData.startsWith('data:') ? rawData : `data:${mediaType};base64,${rawData}`;
+	return {
+		type: 'input_image',
+		image_url: imageUrl,
+		detail: 'auto',
+	};
+}
+
 function stringifyToolCallInput(input: string): string {
 	const trimmed = toTrimmed(input);
 	if (!trimmed) return '{}';
@@ -520,7 +544,10 @@ function stringifyToolCallInput(input: string): string {
 	}
 }
 
-function toCodexInput(messages: Message[], fallbackPrompt = 'Continue.'): {
+function toCodexInput(
+	messages: Message[],
+	fallbackPrompt = 'Continue.',
+): {
 	instructions: string | undefined;
 	input: CodexResponsesInputItem[];
 } {
@@ -539,6 +566,11 @@ function toCodexInput(messages: Message[], fallbackPrompt = 'Continue.'): {
 		if (message.role === 'user') {
 			const content: CodexResponsesMessageContentItem[] = [];
 			for (const part of message.content) {
+				const media = toCodexInputMedia(part);
+				if (media) {
+					content.push(media);
+					continue;
+				}
 				const text = toCodexOutputText(part);
 				if (text) {
 					content.push({
@@ -622,9 +654,7 @@ function toCodexInput(messages: Message[], fallbackPrompt = 'Continue.'): {
 	};
 }
 
-function codexToolFromGenericTool(
-	tool: Tool,
-): CodexResponsesTool | undefined {
+function codexToolFromGenericTool(tool: Tool): CodexResponsesTool | undefined {
 	if (tool.type === 'provider') {
 		return undefined;
 	}
@@ -683,30 +713,55 @@ function normalizeCodexToolParameters(rawSchema: unknown): Record<string, unknow
 	};
 }
 
+function assertSuccessfulCodexResponse(response: CodexResponsesResponse | undefined): void {
+	if (!response) {
+		throw new OperationalError('Codex response stream ended before a terminal event');
+	}
+
+	const status = toTrimmed(response.status);
+	if (status === 'failed') {
+		const detail = toTrimmed(response.error?.message) ?? toTrimmed(response.error?.code);
+		throw new OperationalError(
+			detail ? `Codex response failed: ${detail}` : 'Codex response failed',
+		);
+	}
+	if (status === 'incomplete') {
+		const reason = toTrimmed(response.incomplete_details?.reason);
+		throw new OperationalError(
+			reason ? `Codex response was incomplete: ${reason}` : 'Codex response was incomplete',
+		);
+	}
+}
+
 class CodexResponsesChatModel extends BaseChatModel {
-	private previousResponseId: string | undefined;
+	private readonly sessionId = randomUUID();
+	private readonly threadId = randomUUID();
+	private readonly installationId = randomUUID();
+	private readonly windowId = randomUUID();
 
 	constructor(
 		modelId: string,
 		private readonly config: CodexResponsesChatModelConfig,
 	) {
 		super('openai-codex', modelId);
-		this.previousResponseId = toTrimmed(config.previousResponseId);
 	}
 
-	private getRequestTraceId(): string {
-		return toTrimmed(this.config.sessionKey) ?? randomUUID();
-	}
-
-	private buildRequestHeaders(requestTraceId: string): Record<string, string> {
-		return {
+	private buildRequestHeaders(config?: ChatModelConfig): Record<string, string> {
+		const headers: Record<string, string> = {
 			...this.config.baseHeaders,
-			'x-client-request-id': requestTraceId,
-			session_id: requestTraceId,
+			'x-client-request-id': this.threadId,
+			'session-id': this.sessionId,
+			'thread-id': this.threadId,
+			'x-codex-window-id': this.windowId,
+			...(this.config.useResponsesLite ? { 'x-openai-internal-codex-responses-lite': 'true' } : {}),
 		};
+		for (const [name, value] of Object.entries(config?.headers ?? {})) {
+			if (value !== undefined) headers[name] = value;
+		}
+		return headers;
 	}
 
-	private buildRequest(messages: Message[], requestTraceId: string): CodexResponsesRequest {
+	private buildRequest(messages: Message[], turnId: string): CodexResponsesRequest {
 		const tools: CodexResponsesTool[] = [];
 		for (const tool of this.tools) {
 			const normalizedTool = codexToolFromGenericTool(tool);
@@ -714,29 +769,62 @@ class CodexResponsesChatModel extends BaseChatModel {
 			tools.push(normalizedTool);
 		}
 
-		const { instructions, input } = toCodexInput(messages);
-		const include = this.config.reasoning ? ['reasoning.encrypted_content'] : [];
-		const sessionKey = toTrimmed(this.config.sessionKey);
-		const promptCacheKey = sessionKey ?? requestTraceId;
-		const chainSignature = buildChainRequestSignature(this.modelId, this.config.reasoning);
+		const normalizedInput = toCodexInput(messages);
+		const instructions = normalizedInput.instructions ?? this.config.defaultInstructions;
+		const input = [...normalizedInput.input];
+		if (this.config.useResponsesLite) {
+			for (const item of input) {
+				if (item.type !== 'message') continue;
+				for (const contentItem of item.content) {
+					if (contentItem.type === 'input_image') delete contentItem.detail;
+				}
+			}
+			const prefix: CodexResponsesInputItem[] = [
+				{
+					type: 'additional_tools',
+					role: 'developer',
+					tools,
+				},
+			];
+			if (instructions) {
+				prefix.push({
+					type: 'message',
+					role: 'developer',
+					content: [{ type: 'input_text', text: instructions }],
+				});
+			}
+			input.unshift(...prefix);
+		}
+
+		const reasoning = this.config.reasoning
+			? {
+					...this.config.reasoning,
+					...(this.config.useResponsesLite ? { context: 'all_turns' as const } : {}),
+				}
+			: undefined;
 
 		const request: CodexResponsesRequest = {
 			model: this.modelId,
-			instructions: instructions ?? this.config.defaultInstructions,
+			...(this.config.useResponsesLite ? {} : { instructions }),
 			input,
-			tools,
+			...(this.config.useResponsesLite ? {} : { tools }),
 			tool_choice: 'auto',
-			parallel_tool_calls: this.config.parallelToolCalls,
+			parallel_tool_calls: this.config.parallelToolCalls && !this.config.useResponsesLite,
 			stream: true,
 			store: false,
-			include,
-			prompt_cache_key: promptCacheKey,
-			...(this.config.reasoning ? { reasoning: this.config.reasoning } : {}),
+			include: ['reasoning.encrypted_content'],
+			prompt_cache_key: this.sessionId,
+			...(reasoning ? { reasoning } : {}),
+			...(this.config.serviceTier ? { service_tier: this.config.serviceTier } : {}),
+			...(this.config.verbosity ? { text: { verbosity: this.config.verbosity } } : {}),
+			client_metadata: {
+				'x-codex-installation-id': this.installationId,
+				session_id: this.sessionId,
+				thread_id: this.threadId,
+				turn_id: turnId,
+				'x-codex-window-id': this.windowId,
+			},
 		};
-		const previousResponseId = toTrimmed(this.previousResponseId);
-		if (this.config.contextMode === 'chain_only' && sessionKey && previousResponseId) {
-			request.previous_response_id = previousResponseId;
-		}
 
 		this.config.debugState.toolNames = tools.map((tool) => tool.name);
 		this.config.debugState.lastModel = this.modelId;
@@ -744,47 +832,43 @@ class CodexResponsesChatModel extends BaseChatModel {
 		this.config.debugState.lastParallelToolCalls = String(request.parallel_tool_calls);
 		this.config.debugState.lastToolsPayload =
 			tools.length > 0 ? truncateErrorValue(JSON.stringify(tools)) : undefined;
-		this.config.debugState.lastReasoning = this.config.reasoning
-			? truncateErrorValue(JSON.stringify(this.config.reasoning))
+		this.config.debugState.lastReasoning = reasoning
+			? truncateErrorValue(JSON.stringify(reasoning))
 			: undefined;
-		this.config.debugState.lastContextMode = this.config.contextMode;
-		this.config.debugState.lastChainSignature = chainSignature;
-		this.config.debugState.lastSessionKey = sessionKey;
-		this.config.debugState.lastPreviousResponseId = previousResponseId;
 		this.config.debugState.lastRequestKeys = Object.keys(request).sort().join(',');
 		setInputDebugState(request.input, this.config.debugState);
 
 		return request;
 	}
 
-	private async persistPreviousResponseId(response: CodexResponsesResponse | undefined): Promise<void> {
-		if (this.config.contextMode !== 'chain_only') return;
-
-		const sessionKey = toTrimmed(this.config.sessionKey);
-		const responseId = toTrimmed(response?.id);
-		if (!sessionKey || !responseId) return;
-
-		this.previousResponseId = responseId;
-		this.config.debugState.lastPreviousResponseId = responseId;
-
-		if (this.config.savePreviousResponseId) {
-			await this.config.savePreviousResponseId(sessionKey, responseId);
-		}
-	}
-
 	private async openResponsesStream(
 		request: CodexResponsesRequest,
-		requestTraceId: string,
+		config?: ChatModelConfig,
 	): Promise<AsyncIterableIterator<Buffer | Uint8Array>> {
-		const response = await this.config.openStreamRequest(
+		let response = await this.config.openStreamRequest(
 			request,
-			this.buildRequestHeaders(requestTraceId),
+			this.buildRequestHeaders(config),
+			config,
 		);
+
+		if (response.statusCode === 401) {
+			const refreshedHeaders = await this.config.refreshAuthHeaders();
+			response = await this.config.openStreamRequest(
+				request,
+				{
+					...this.buildRequestHeaders(config),
+					...refreshedHeaders,
+				},
+				config,
+			);
+		}
 
 		if (response.statusCode < 200 || response.statusCode > 299) {
 			const errorPayload = {
 				status: response.statusCode,
-				message: extractBackendErrorMessage(response.body) ?? `${response.statusCode} status code (no body)`,
+				message:
+					extractBackendErrorMessage(response.body) ??
+					`${response.statusCode} status code (no body)`,
 				response: {
 					status: response.statusCode,
 					data: response.body,
@@ -801,29 +885,44 @@ class CodexResponsesChatModel extends BaseChatModel {
 		}
 
 		if (!isAsyncBufferIterable(response.body)) {
-			throw new ApplicationError('Codex backend did not return a stream body');
+			throw new OperationalError('Codex backend did not return a stream body');
 		}
 
 		return response.body;
 	}
 
-	async generate(messages: Message[]): Promise<GenerateResult> {
-		const requestTraceId = this.getRequestTraceId();
-		const request = this.buildRequest(messages, requestTraceId);
-		const stream = await this.openResponsesStream(request, requestTraceId);
+	async generate(messages: Message[], config?: ChatModelConfig): Promise<GenerateResult> {
+		const request = this.buildRequest(messages, randomUUID());
+		const stream = await this.openResponsesStream(request, config);
 
 		let text = '';
-		const streamedToolCalls: Array<{ id: string; name: string; argumentsRaw: string }> = [];
+		let reasoning = '';
+		const streamedToolCalls: Array<{
+			id: string;
+			name: string;
+			argumentsRaw: string;
+		}> = [];
 		const toolCallBuffers: Record<number, { id: string; name: string; argumentsRaw: string }> = {};
 		let finalResponse: CodexResponsesResponse | undefined;
+		let reportedModel: string | undefined;
 
 		for await (const event of parseCodexStreamEvents(stream)) {
+			reportedModel = getReportedModelFromEvent(event) ?? reportedModel;
 			const eventType = toTrimmed(event.type);
 			if (!eventType) continue;
 
 			if (eventType === 'response.output_text.delta') {
 				const delta = toStringValue(event.delta);
 				if (delta) text += delta;
+				continue;
+			}
+
+			if (
+				eventType === 'response.reasoning_summary_text.delta' ||
+				eventType === 'response.reasoning_text.delta'
+			) {
+				const delta = toStringValue(event.delta);
+				if (delta) reasoning += delta;
 				continue;
 			}
 
@@ -866,12 +965,20 @@ class CodexResponsesChatModel extends BaseChatModel {
 				continue;
 			}
 
-			if (eventType === 'response.done' || eventType === 'response.completed') {
+			if (
+				eventType === 'response.done' ||
+				eventType === 'response.completed' ||
+				eventType === 'response.failed' ||
+				eventType === 'response.incomplete'
+			) {
 				finalResponse = toObject(event.response) as CodexResponsesResponse | undefined;
 			}
 		}
+		if (finalResponse && reportedModel && !toTrimmed(finalResponse.model)) {
+			finalResponse = { ...finalResponse, model: reportedModel };
+		}
 
-		await this.persistPreviousResponseId(finalResponse);
+		assertSuccessfulCodexResponse(finalResponse);
 		assertNoModelSubstitution(this.modelId, finalResponse);
 
 		const parsedOutput = parseCodexOutputItems(finalResponse?.output);
@@ -887,6 +994,12 @@ class CodexResponsesChatModel extends BaseChatModel {
 
 		const finalText = text || parsedOutput.text;
 		const content: MessageContent[] = [];
+		if (reasoning) {
+			content.push({
+				type: 'reasoning',
+				text: reasoning,
+			});
+		}
 		for (const toolCall of mergedToolCalls.values()) {
 			const parsedArguments = parseToolCallArguments(toolCall.argumentsRaw || '{}');
 			content.push({
@@ -896,14 +1009,16 @@ class CodexResponsesChatModel extends BaseChatModel {
 				input: JSON.stringify(parsedArguments),
 			});
 		}
-		content.push({
-			type: 'text',
-			text: finalText,
-		});
+		if (finalText) {
+			content.push({
+				type: 'text',
+				text: finalText,
+			});
+		}
 
 		return {
 			id: toTrimmed(finalResponse?.id) ?? randomUUID(),
-			finishReason: toTrimmed(finalResponse?.status) === 'completed' ? 'stop' : 'other',
+			finishReason: mergedToolCalls.size > 0 ? 'tool-calls' : 'stop',
 			usage: parseCodexTokenUsage(finalResponse?.usage),
 			message: {
 				role: 'assistant',
@@ -920,13 +1035,15 @@ class CodexResponsesChatModel extends BaseChatModel {
 		};
 	}
 
-	async *stream(messages: Message[]): AsyncIterable<StreamChunk> {
-		const requestTraceId = this.getRequestTraceId();
-		const request = this.buildRequest(messages, requestTraceId);
-		const stream = await this.openResponsesStream(request, requestTraceId);
+	async *stream(messages: Message[], config?: ChatModelConfig): AsyncIterable<StreamChunk> {
+		const request = this.buildRequest(messages, randomUUID());
+		const stream = await this.openResponsesStream(request, config);
 		const toolCallBuffers: Record<number, { id: string; name: string; argumentsRaw: string }> = {};
+		let emittedToolCall = false;
+		let reportedModel: string | undefined;
 
 		for await (const event of parseCodexStreamEvents(stream)) {
+			reportedModel = getReportedModelFromEvent(event) ?? reportedModel;
 			const eventType = toTrimmed(event.type);
 			if (!eventType) continue;
 
@@ -938,7 +1055,10 @@ class CodexResponsesChatModel extends BaseChatModel {
 				continue;
 			}
 
-			if (eventType === 'response.reasoning_summary_text.delta') {
+			if (
+				eventType === 'response.reasoning_summary_text.delta' ||
+				eventType === 'response.reasoning_text.delta'
+			) {
 				const delta = toStringValue(event.delta);
 				if (delta) {
 					yield { type: 'reasoning-delta', delta };
@@ -977,32 +1097,38 @@ class CodexResponsesChatModel extends BaseChatModel {
 				const callId = toTrimmed(item.call_id) ?? buffered?.id;
 				const name = toTrimmed(item.name) ?? buffered?.name;
 				if (!callId || !name) continue;
-					yield {
-						type: 'tool-call-delta',
-						id: callId,
-						name,
-						argumentsDelta: buffered?.argumentsRaw || toStringValue(item.arguments) || '{}',
-					};
+				emittedToolCall = true;
+				yield {
+					type: 'tool-call-delta',
+					id: callId,
+					name,
+					argumentsDelta: buffered?.argumentsRaw || toStringValue(item.arguments) || '{}',
+				};
 				continue;
 			}
 
-			if (eventType === 'response.done' || eventType === 'response.completed') {
-				const response = toObject(event.response) as CodexResponsesResponse | undefined;
-				await this.persistPreviousResponseId(response);
+			if (
+				eventType === 'response.done' ||
+				eventType === 'response.completed' ||
+				eventType === 'response.failed' ||
+				eventType === 'response.incomplete'
+			) {
+				let response = toObject(event.response) as CodexResponsesResponse | undefined;
+				if (response && reportedModel && !toTrimmed(response.model)) {
+					response = { ...response, model: reportedModel };
+				}
+				assertSuccessfulCodexResponse(response);
 				assertNoModelSubstitution(this.modelId, response);
 				yield {
 					type: 'finish',
-					finishReason: 'stop',
+					finishReason: emittedToolCall ? 'tool-calls' : 'stop',
 					usage: parseCodexTokenUsage(response?.usage),
 				};
 				return;
 			}
 		}
 
-		yield {
-			type: 'finish',
-			finishReason: 'stop',
-		};
+		throw new OperationalError('Codex response stream ended before a terminal event');
 	}
 }
 
@@ -1014,12 +1140,6 @@ function toTrimmed(value: unknown): string | undefined {
 
 function toStringValue(value: unknown): string | undefined {
 	return typeof value === 'string' ? value : undefined;
-}
-
-function toWholeSemver(version: string): string {
-	const trimmed = version.trim();
-	const match = trimmed.match(/^(\d+\.\d+\.\d+)/);
-	return match?.[1] ?? trimmed;
 }
 
 function toFiniteNumber(value: unknown): number | undefined {
@@ -1101,7 +1221,7 @@ function getJwtExpirationMs(token?: string): number | undefined {
 	return exp * 1000;
 }
 
-function isJwtExpiredOrAlmostExpired(token?: string, leewayMs = 60_000): boolean {
+function isJwtExpiredOrAlmostExpired(token?: string, leewayMs = 5 * 60_000): boolean {
 	const exp = getJwtExpirationMs(token);
 	if (!exp) return false;
 	return exp <= Date.now() + leewayMs;
@@ -1123,19 +1243,14 @@ function normalizeAuthJson(value: unknown): CodexAuthJson {
 	if (typeof value === 'string') {
 		const text = value.trim();
 		if (!text) {
-			throw new ApplicationError('Auth JSON is empty');
+			throw new OperationalError('Auth JSON is empty');
 		}
 
-		try {
-			parsed = JSON.parse(text);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			throw new ApplicationError(`Auth JSON is invalid: ${message}`);
-		}
+		parsed = JSON.parse(text);
 	}
 
 	if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-		throw new ApplicationError('Auth JSON root must be an object');
+		throw new OperationalError('Auth JSON root must be an object');
 	}
 
 	return parsed as CodexAuthJson;
@@ -1228,22 +1343,12 @@ function getRuntimeState(key: string): RuntimeNodeState {
 	return runtimeNodeState.get(key) ?? {};
 }
 
-function hasSessionConversations(state: RuntimeNodeState): boolean {
-	const sessions = state.sessionConversations;
-	return Boolean(sessions && Object.keys(sessions).length > 0);
-}
-
 function hasModelsCatalogState(state: RuntimeNodeState): boolean {
 	return Boolean(state.modelsCatalog && state.modelsCatalog.models.length > 0);
 }
 
 function hasRuntimeState(state: RuntimeNodeState): boolean {
-	return Boolean(
-		state.codexAuthJson ||
-			state.codexDeviceAuth ||
-			hasSessionConversations(state) ||
-			hasModelsCatalogState(state),
-	);
+	return Boolean(state.codexAuthJson || state.codexDeviceAuth || hasModelsCatalogState(state));
 }
 
 function setRuntimeAuthState(key: string, auth: CodexAuthJson | undefined): void {
@@ -1276,25 +1381,10 @@ function setRuntimeDeviceState(key: string, state: DeviceCodeState | undefined):
 	}
 }
 
-function setRuntimeSessionConversations(
+function setRuntimeModelsCatalogState(
 	key: string,
-	sessionConversations: Record<string, SessionConversationState> | undefined,
+	modelsCatalog: ModelsCatalogState | undefined,
 ): void {
-	const current = getRuntimeState(key);
-	if (sessionConversations && Object.keys(sessionConversations).length > 0) {
-		current.sessionConversations = { ...sessionConversations };
-	} else {
-		delete current.sessionConversations;
-	}
-
-	if (hasRuntimeState(current)) {
-		runtimeNodeState.set(key, current);
-	} else {
-		runtimeNodeState.delete(key);
-	}
-}
-
-function setRuntimeModelsCatalogState(key: string, modelsCatalog: ModelsCatalogState | undefined): void {
 	const current = getRuntimeState(key);
 	if (modelsCatalog && modelsCatalog.models.length > 0) {
 		current.modelsCatalog = {
@@ -1337,38 +1427,6 @@ function getSystemErrorCode(error: unknown): string | undefined {
 	return toTrimmed(toObject(error)?.code);
 }
 
-function normalizeSessionConversations(
-	value: unknown,
-): Record<string, SessionConversationState> | undefined {
-	const parsed = toObject(value);
-	if (!parsed) return undefined;
-
-	const normalized: Record<string, SessionConversationState> = {};
-	for (const [rawKey, rawState] of Object.entries(parsed)) {
-		const key = toTrimmed(rawKey);
-		if (!key) continue;
-		const stateObj = toObject(rawState);
-		if (!stateObj) continue;
-
-		const previousResponseId = toTrimmed(
-			stateObj.previousResponseId ?? stateObj.previous_response_id,
-		);
-		const requestSignature = toTrimmed(
-			stateObj.requestSignature ?? stateObj.request_signature,
-		);
-		const updatedAt = toTrimmed(stateObj.updatedAt ?? stateObj.updated_at);
-		if (!previousResponseId && !updatedAt && !requestSignature) continue;
-
-		normalized[key] = {
-			...(previousResponseId ? { previousResponseId } : {}),
-			...(requestSignature ? { requestSignature } : {}),
-			...(updatedAt ? { updatedAt } : {}),
-		};
-	}
-
-	return Object.keys(normalized).length > 0 ? normalized : undefined;
-}
-
 function normalizeModelVisibility(value: unknown): PersistedModelInfo['visibility'] {
 	const normalized = toTrimmed(value)?.toLowerCase();
 	if (normalized === 'hide') return 'hide';
@@ -1378,33 +1436,68 @@ function normalizeModelVisibility(value: unknown): PersistedModelInfo['visibilit
 
 function normalizeModelReasoningEffort(value: unknown): ModelReasoningEffort | undefined {
 	const normalized = toTrimmed(value)?.toLowerCase();
-	if (
-		normalized === 'minimal' ||
-		normalized === 'low' ||
-		normalized === 'medium' ||
-		normalized === 'high' ||
-		normalized === 'xhigh'
-	) {
+	if (!normalized || normalized === 'none' || normalized === 'default') return undefined;
+	if (normalized === 'mid') return 'medium';
+	return /^[a-z0-9_-]+$/.test(normalized) ? normalized : undefined;
+}
+
+function normalizeReasoningProfiles(
+	value: unknown,
+): PersistedModelInfo['supportedReasoningEfforts'] {
+	const entries = Array.isArray(value) ? value : [];
+	const profiles = new Map<
+		ModelReasoningEffort,
+		{ effort: ModelReasoningEffort; description?: string }
+	>();
+	for (const entry of entries) {
+		const obj = toObject(entry);
+		const effort = normalizeModelReasoningEffort(obj?.effort ?? obj?.value ?? entry);
+		if (!effort) continue;
+		const description = toTrimmed(obj?.description);
+		profiles.set(effort, { effort, ...(description ? { description } : {}) });
+	}
+	return [...profiles.values()];
+}
+
+function normalizeReasoningSummary(value: unknown): CodexReasoningSummary {
+	const normalized = toTrimmed(value)?.toLowerCase();
+	if (normalized === 'auto' || normalized === 'concise' || normalized === 'detailed') {
 		return normalized;
 	}
+	return 'none';
+}
 
-	// Some payloads use `mid`; normalize to protocol value.
-	if (normalized === 'mid') {
-		return 'medium';
+function normalizeVerbosity(value: unknown): CodexVerbosity | undefined {
+	const normalized = toTrimmed(value)?.toLowerCase();
+	return normalized === 'low' || normalized === 'medium' || normalized === 'high'
+		? normalized
+		: undefined;
+}
+
+function normalizeServiceTiers(value: unknown): ModelServiceTier[] {
+	const entries = Array.isArray(value) ? value : [];
+	const tiers: ModelServiceTier[] = [];
+	for (const entry of entries) {
+		const obj = toObject(entry);
+		const id = toTrimmed(obj?.id);
+		const name = toTrimmed(obj?.name);
+		if (!id || !name) continue;
+		const description = toTrimmed(obj?.description);
+		tiers.push({ id, name, ...(description ? { description } : {}) });
 	}
-
-	return undefined;
+	return tiers;
 }
 
 function defaultReasoningEffortForSupported(
-	supported: ReadonlyArray<ModelReasoningEffort>,
+	supported: PersistedModelInfo['supportedReasoningEfforts'],
 	preferred?: unknown,
 ): CodexReasoningEffort {
 	const normalizedPreferred = normalizeModelReasoningEffort(preferred);
-	if (normalizedPreferred && supported.includes(normalizedPreferred)) {
+	const efforts = supported.map((profile) => profile.effort);
+	if (normalizedPreferred && efforts.includes(normalizedPreferred)) {
 		return normalizedPreferred;
 	}
-	return supported.includes('medium') ? 'medium' : supported[0] ?? 'none';
+	return efforts.includes('medium') ? 'medium' : (efforts[0] ?? 'none');
 }
 
 function normalizePersistedModelInfo(value: unknown): PersistedModelInfo | undefined {
@@ -1415,9 +1508,7 @@ function normalizePersistedModelInfo(value: unknown): PersistedModelInfo | undef
 	if (!slug) return undefined;
 
 	const displayName =
-		toTrimmed(obj.displayName ?? obj.display_name) ??
-		FALLBACK_MODEL_NAME_BY_SLUG.get(slug) ??
-		slug;
+		toTrimmed(obj.displayName ?? obj.display_name) ?? FALLBACK_MODEL_NAME_BY_SLUG.get(slug) ?? slug;
 	const priority = Math.floor(toFiniteNumber(obj.priority) ?? 10_000);
 	const supportedInApi =
 		typeof obj.supportedInApi === 'boolean'
@@ -1430,25 +1521,32 @@ function normalizePersistedModelInfo(value: unknown): PersistedModelInfo | undef
 			? obj.supportsParallelToolCalls
 			: typeof obj.supports_parallel_tool_calls === 'boolean'
 				? obj.supports_parallel_tool_calls
-				: Boolean(MODEL_SUPPORTS_PARALLEL_TOOL_CALLS[slug]);
+				: false;
 
 	const supportedReasoningEffortsRaw = Array.isArray(obj.supportedReasoningEfforts)
 		? obj.supportedReasoningEfforts
-		: Array.isArray(obj.supported_reasoning_efforts)
-			? obj.supported_reasoning_efforts
-			: undefined;
-	let supportedReasoningEfforts = supportedReasoningEffortsRaw
-		?.map((entry) => normalizeModelReasoningEffort(entry))
-		.filter((entry): entry is ModelReasoningEffort => Boolean(entry));
+		: Array.isArray(obj.supported_reasoning_levels)
+			? obj.supported_reasoning_levels
+			: Array.isArray(obj.supported_reasoning_efforts)
+				? obj.supported_reasoning_efforts
+				: undefined;
+	let supportedReasoningEfforts = normalizeReasoningProfiles(supportedReasoningEffortsRaw);
 
-	if (!supportedReasoningEfforts || supportedReasoningEfforts.length === 0) {
+	if (supportedReasoningEfforts.length === 0) {
 		const fallbackEfforts = MODEL_REASONING_EFFORTS[slug];
-		supportedReasoningEfforts = fallbackEfforts ? [...fallbackEfforts] : [];
+		supportedReasoningEfforts = (fallbackEfforts ?? []).map((effort) => ({
+			effort,
+		}));
 	}
+	const supportsReasoningSummaryValue =
+		obj.supportsReasoningSummary ?? obj.supports_reasoning_summary_parameter;
+	const supportsVerbosityValue = obj.supportsVerbosity ?? obj.support_verbosity;
+	const defaultServiceTier = toTrimmed(obj.defaultServiceTier ?? obj.default_service_tier);
 
 	return {
 		slug,
 		displayName,
+		description: toTrimmed(obj.description),
 		priority,
 		supportedInApi,
 		visibility: normalizeModelVisibility(obj.visibility),
@@ -1456,8 +1554,19 @@ function normalizePersistedModelInfo(value: unknown): PersistedModelInfo | undef
 		supportedReasoningEfforts,
 		defaultReasoningEffort: defaultReasoningEffortForSupported(
 			supportedReasoningEfforts,
-			obj.defaultReasoningEffort ?? obj.default_reasoning_effort,
+			obj.defaultReasoningEffort ?? obj.default_reasoning_level ?? obj.default_reasoning_effort,
 		),
+		supportsReasoningSummary:
+			typeof supportsReasoningSummaryValue === 'boolean' ? supportsReasoningSummaryValue : true,
+		defaultReasoningSummary: normalizeReasoningSummary(
+			obj.defaultReasoningSummary ?? obj.default_reasoning_summary,
+		),
+		supportsVerbosity: typeof supportsVerbosityValue === 'boolean' ? supportsVerbosityValue : false,
+		defaultVerbosity: normalizeVerbosity(obj.defaultVerbosity ?? obj.default_verbosity),
+		serviceTiers: normalizeServiceTiers(obj.serviceTiers ?? obj.service_tiers),
+		...(defaultServiceTier ? { defaultServiceTier } : {}),
+		useResponsesLite: Boolean(obj.useResponsesLite ?? obj.use_responses_lite),
+		baseInstructions: toTrimmed(obj.baseInstructions ?? obj.base_instructions),
 	};
 }
 
@@ -1491,59 +1600,146 @@ function normalizeModelsCatalogState(value: unknown): ModelsCatalogState | undef
 	};
 }
 
-function buildFallbackModelsCatalog(): ModelsCatalogState {
-	const models: PersistedModelInfo[] = [];
-	let priority = 1000;
-
-	for (const option of MODEL_OPTIONS) {
-		const value = normalizeModelName(String(option.value));
-		if (!value || value === CUSTOM_MODEL_VALUE) continue;
-
-		const supportedReasoningEfforts = MODEL_REASONING_EFFORTS[value]
-			? [...MODEL_REASONING_EFFORTS[value]]
-			: [];
-
-		models.push({
-			slug: value,
-			displayName: option.name,
-			priority,
-			supportedInApi: true,
-			visibility: 'list',
-			supportsParallelToolCalls: Boolean(MODEL_SUPPORTS_PARALLEL_TOOL_CALLS[value]),
-			supportedReasoningEfforts,
-			defaultReasoningEffort: defaultReasoningEffortForSupported(supportedReasoningEfforts),
-		});
-
-		priority += 1;
-	}
-
+function fallbackModel(
+	slug: string,
+	displayName: string,
+	description: string,
+	priority: number,
+	visibility: PersistedModelInfo['visibility'],
+	defaultReasoningEffort: ModelReasoningEffort,
+	defaultReasoningSummary: CodexReasoningSummary,
+	defaultVerbosity: CodexVerbosity,
+	useResponsesLite: boolean,
+	serviceTiers: ModelServiceTier[] = [],
+): PersistedModelInfo {
 	return {
-		fetchedAt: new Date(0).toISOString(),
-		models,
+		slug,
+		displayName,
+		description,
+		priority,
+		supportedInApi: true,
+		visibility,
+		supportsParallelToolCalls: true,
+		supportedReasoningEfforts: (MODEL_REASONING_EFFORTS[slug] ?? []).map((effort) => ({ effort })),
+		defaultReasoningEffort,
+		supportsReasoningSummary: true,
+		defaultReasoningSummary,
+		supportsVerbosity: true,
+		defaultVerbosity,
+		serviceTiers,
+		useResponsesLite,
 	};
 }
 
-const FALLBACK_MODELS_CATALOG = buildFallbackModelsCatalog();
+const PRIORITY_SERVICE_TIER: ModelServiceTier[] = [
+	{ id: 'priority', name: 'Fast', description: '1.5x speed, increased usage' },
+];
+
+const FALLBACK_MODELS_CATALOG: ModelsCatalogState = {
+	fetchedAt: new Date(0).toISOString(),
+	models: [
+		fallbackModel(
+			'gpt-5.6-sol',
+			'GPT-5.6-Sol',
+			'Latest frontier agentic coding model.',
+			1,
+			'list',
+			'low',
+			'none',
+			'low',
+			true,
+			PRIORITY_SERVICE_TIER,
+		),
+		fallbackModel(
+			'gpt-5.6-terra',
+			'GPT-5.6-Terra',
+			'Balanced agentic coding model for everyday work.',
+			2,
+			'list',
+			'medium',
+			'none',
+			'low',
+			true,
+			PRIORITY_SERVICE_TIER,
+		),
+		fallbackModel(
+			'gpt-5.6-luna',
+			'GPT-5.6-Luna',
+			'Fast and affordable agentic coding model.',
+			3,
+			'list',
+			'medium',
+			'none',
+			'low',
+			true,
+			PRIORITY_SERVICE_TIER,
+		),
+		fallbackModel(
+			'gpt-5.5',
+			'GPT-5.5',
+			'Frontier model for complex coding, research, and real-world work.',
+			7,
+			'list',
+			'medium',
+			'none',
+			'low',
+			false,
+			PRIORITY_SERVICE_TIER,
+		),
+		fallbackModel(
+			'gpt-5.4',
+			'GPT-5.4',
+			'Strong model for everyday coding.',
+			16,
+			'hide',
+			'medium',
+			'none',
+			'low',
+			false,
+			PRIORITY_SERVICE_TIER,
+		),
+		fallbackModel(
+			'gpt-5.4-mini',
+			'GPT-5.4-Mini',
+			'Small, fast, and cost-efficient model for simpler coding tasks.',
+			23,
+			'hide',
+			'medium',
+			'none',
+			'medium',
+			false,
+		),
+		fallbackModel(
+			'gpt-5.2',
+			'GPT-5.2',
+			'Optimized for professional work and long-running agents.',
+			29,
+			'list',
+			'medium',
+			'auto',
+			'low',
+			false,
+		),
+		fallbackModel(
+			'codex-auto-review',
+			'Codex Auto Review',
+			'Automatic approval review model for Codex.',
+			43,
+			'hide',
+			'medium',
+			'none',
+			'low',
+			false,
+		),
+	],
+};
 
 function mergeWithFallbackCatalog(catalog: ModelsCatalogState | undefined): ModelsCatalogState {
 	if (!catalog || catalog.models.length === 0) {
 		return FALLBACK_MODELS_CATALOG;
 	}
 
-	const merged = new Map<string, PersistedModelInfo>();
-	for (const model of FALLBACK_MODELS_CATALOG.models) {
-		merged.set(model.slug, model);
-	}
-	for (const model of catalog.models) {
-		merged.set(model.slug, model);
-	}
-
-	return {
-		fetchedAt: catalog.fetchedAt,
-		models: [...merged.values()].sort((a, b) =>
-			a.priority === b.priority ? a.slug.localeCompare(b.slug) : a.priority - b.priority,
-		),
-	};
+	return catalog;
 }
 
 function isModelsCatalogFresh(catalog: ModelsCatalogState | undefined): boolean {
@@ -1575,6 +1771,7 @@ function getModelOptionsFromCatalog(catalog: ModelsCatalogState): INodePropertyO
 		options.push({
 			name: model.displayName,
 			value: model.slug,
+			...(model.description ? { description: model.description } : {}),
 		});
 	}
 
@@ -1593,11 +1790,6 @@ function normalizePersistedState(value: unknown): RuntimeNodeState {
 	const deviceState = normalizeDeviceCodeState(parsed.codexDeviceAuth);
 	if (deviceState) {
 		state.codexDeviceAuth = deviceState;
-	}
-
-	const sessionConversations = normalizeSessionConversations(parsed.sessionConversations);
-	if (sessionConversations) {
-		state.sessionConversations = sessionConversations;
 	}
 
 	const modelsCatalog = normalizeModelsCatalogState(parsed.modelsCatalog ?? parsed.models_catalog);
@@ -1620,7 +1812,8 @@ async function readPersistedState(context: PersistedStateContext): Promise<Runti
 			return {};
 		}
 
-		throw new ApplicationError(
+		throw new NodeOperationError(
+			context.getNode(),
 			`Failed to read persisted Codex auth state: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
@@ -1641,11 +1834,9 @@ async function writePersistedState(
 	}
 
 	if (state.codexDeviceAuth) {
-		payload.codexDeviceAuth = { ...state.codexDeviceAuth } as unknown as IDataObject;
-	}
-
-	if (state.sessionConversations && Object.keys(state.sessionConversations).length > 0) {
-		payload.sessionConversations = state.sessionConversations as unknown as IDataObject;
+		payload.codexDeviceAuth = {
+			...state.codexDeviceAuth,
+		} as unknown as IDataObject;
 	}
 
 	if (state.modelsCatalog && state.modelsCatalog.models.length > 0) {
@@ -1656,12 +1847,23 @@ async function writePersistedState(
 	}
 
 	try {
-		await mkdir(dirname(filePath), { recursive: true });
-		const tempPath = `${filePath}.tmp`;
-		await writeFile(tempPath, `${JSON.stringify(payload)}\n`, { encoding: 'utf8' });
+		const stateDirectory = dirname(filePath);
+		await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+		if (process.platform !== 'win32') {
+			await chmod(stateDirectory, 0o700);
+		}
+		const tempPath = `${filePath}.${randomUUID()}.tmp`;
+		await writeFile(tempPath, `${JSON.stringify(payload)}\n`, {
+			encoding: 'utf8',
+			mode: 0o600,
+		});
 		await rename(tempPath, filePath);
+		if (process.platform !== 'win32') {
+			await chmod(filePath, 0o600);
+		}
 	} catch (error) {
-		throw new ApplicationError(
+		throw new NodeOperationError(
+			context.getNode(),
 			`Failed to write persisted Codex auth state: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
@@ -1681,11 +1883,6 @@ async function loadNodeState(
 		persistedState.codexDeviceAuth ??
 		nodeStaticData.codexDeviceAuth ??
 		runtimeState.codexDeviceAuth;
-	const sessionConversationsRaw =
-		persistedState.sessionConversations ??
-		nodeStaticData.sessionConversations ??
-		runtimeState.sessionConversations;
-	const sessionConversations = normalizeSessionConversations(sessionConversationsRaw);
 	const modelsCatalogRaw =
 		persistedState.modelsCatalog ?? nodeStaticData.modelsCatalog ?? runtimeState.modelsCatalog;
 	const modelsCatalog = normalizeModelsCatalogState(modelsCatalogRaw);
@@ -1693,7 +1890,6 @@ async function loadNodeState(
 	return {
 		codexAuthJson: authRaw ? normalizeAuthJson(authRaw) : undefined,
 		codexDeviceAuth: normalizeDeviceCodeState(deviceRaw),
-		sessionConversations,
 		modelsCatalog,
 	};
 }
@@ -1704,36 +1900,15 @@ async function saveNodeState(
 	nodeStaticData: IDataObject,
 	state: RuntimeNodeState,
 ): Promise<void> {
-	if (state.codexAuthJson) {
-		nodeStaticData.codexAuthJson = deepCloneAuthJson(state.codexAuthJson) as unknown as IDataObject;
-	} else {
-		delete nodeStaticData.codexAuthJson;
-	}
-
-	if (state.codexDeviceAuth) {
-		nodeStaticData.codexDeviceAuth = { ...state.codexDeviceAuth } as unknown as IDataObject;
-	} else {
-		delete nodeStaticData.codexDeviceAuth;
-	}
-
-	if (state.sessionConversations && Object.keys(state.sessionConversations).length > 0) {
-		nodeStaticData.sessionConversations = state.sessionConversations as unknown as IDataObject;
-	} else {
-		delete nodeStaticData.sessionConversations;
-	}
-
-	if (state.modelsCatalog && state.modelsCatalog.models.length > 0) {
-		nodeStaticData.modelsCatalog = {
-			fetchedAt: state.modelsCatalog.fetchedAt,
-			models: state.modelsCatalog.models.map((model) => ({ ...model })),
-		} as unknown as IDataObject;
-	} else {
-		delete nodeStaticData.modelsCatalog;
-	}
+	// Migrate secrets written by older releases out of workflow static data. The state file is
+	// local to the n8n instance and is written with owner-only permissions below.
+	delete nodeStaticData.codexAuthJson;
+	delete nodeStaticData.codexDeviceAuth;
+	delete nodeStaticData.sessionConversations;
+	delete nodeStaticData.modelsCatalog;
 
 	setRuntimeAuthState(runtimeStateKey, state.codexAuthJson);
 	setRuntimeDeviceState(runtimeStateKey, state.codexDeviceAuth);
-	setRuntimeSessionConversations(runtimeStateKey, state.sessionConversations);
 	setRuntimeModelsCatalogState(runtimeStateKey, state.modelsCatalog);
 
 	await writePersistedState(context, state);
@@ -1757,12 +1932,12 @@ async function requestDeviceCode(context: AuthRequestContext): Promise<DeviceCod
 	if (response.statusCode < 200 || response.statusCode > 299) {
 		const detail = extractBackendErrorMessage(response.body);
 		if (response.statusCode === 404) {
-			throw new ApplicationError(
+			throw new OperationalError(
 				'Device-code login is not enabled for this auth server. Use Codex browser login and re-try.',
 			);
 		}
 
-		throw new ApplicationError(
+		throw new OperationalError(
 			detail
 				? `Device-code start failed with status ${response.statusCode}: ${detail}`
 				: `Device-code start failed with status ${response.statusCode}`,
@@ -1774,7 +1949,7 @@ async function requestDeviceCode(context: AuthRequestContext): Promise<DeviceCod
 	const userCode = toTrimmed(payload.user_code) ?? toTrimmed(payload.usercode);
 
 	if (!deviceAuthId || !userCode) {
-		throw new ApplicationError('Device-code response is missing required fields');
+		throw new OperationalError('Device-code response is missing required fields');
 	}
 
 	return {
@@ -1844,7 +2019,7 @@ async function pollDeviceCode(
 
 	if (response.statusCode < 200 || response.statusCode > 299) {
 		const detail = extractBackendErrorMessage(response.body);
-		throw new ApplicationError(
+		throw new OperationalError(
 			detail
 				? `Device-code poll failed with status ${response.statusCode}: ${detail}`
 				: `Device-code poll failed with status ${response.statusCode}`,
@@ -1853,7 +2028,7 @@ async function pollDeviceCode(
 
 	const payload = (toObject(response.body) ?? {}) as DeviceCodePollSuccess;
 	if (!toTrimmed(payload.authorization_code) || !toTrimmed(payload.code_verifier)) {
-		throw new ApplicationError('Device-code poll succeeded but authorization payload is invalid');
+		throw new OperationalError('Device-code poll succeeded but authorization payload is invalid');
 	}
 
 	return { status: 'authorized', token: payload };
@@ -1886,7 +2061,7 @@ async function exchangeAuthorizationCodeForTokens(
 
 	if (response.statusCode < 200 || response.statusCode > 299) {
 		const detail = extractBackendErrorMessage(response.body);
-		throw new ApplicationError(
+		throw new OperationalError(
 			detail
 				? `Authorization-code exchange failed with status ${response.statusCode}: ${detail}`
 				: `Authorization-code exchange failed with status ${response.statusCode}`,
@@ -1899,7 +2074,7 @@ async function exchangeAuthorizationCodeForTokens(
 	const idToken = toTrimmed(payload.id_token);
 
 	if (!accessToken || !refreshToken || !idToken) {
-		throw new ApplicationError('Authorization-code exchange did not return full token set');
+		throw new OperationalError('Authorization-code exchange did not return full token set');
 	}
 
 	const accountId = extractChatgptAccountId(idToken) ?? extractChatgptAccountId(accessToken);
@@ -1952,7 +2127,6 @@ function resolveDefaultHeaders(chatgptAccountId: string): Record<string, string>
 	const headers: Record<string, string> = {
 		originator: DEFAULT_ORIGINATOR,
 		'chatgpt-account-id': chatgptAccountId,
-		version: CODEX_NODE_VERSION,
 		'User-Agent': CODEX_USER_AGENT,
 	};
 
@@ -2016,11 +2190,7 @@ function getErrorCode(error: unknown): string | undefined {
 	const obj = toObject(error);
 	const body = getErrorBodyObject(error);
 
-	return (
-		toTrimmed(obj?.code) ??
-		toTrimmed(body?.code) ??
-		toTrimmed(toObject(body?.error)?.code)
-	);
+	return toTrimmed(obj?.code) ?? toTrimmed(body?.code) ?? toTrimmed(toObject(body?.error)?.code);
 }
 
 function getErrorMessage(error: unknown): string | undefined {
@@ -2028,9 +2198,7 @@ function getErrorMessage(error: unknown): string | undefined {
 	const body = getErrorBodyObject(error);
 
 	return (
-		toTrimmed(body?.message) ??
-		toTrimmed(toObject(body?.error)?.message) ??
-		toTrimmed(obj?.message)
+		toTrimmed(body?.message) ?? toTrimmed(toObject(body?.error)?.message) ?? toTrimmed(obj?.message)
 	);
 }
 
@@ -2064,7 +2232,7 @@ function getErrorBodySummary(error: unknown): string | undefined {
 	return undefined;
 }
 
-function buildUnauthorizedModelError(error: unknown, chatgptAccountId: string): ApplicationError {
+function buildUnauthorizedModelError(error: unknown, chatgptAccountId: string): OperationalError {
 	const status = getErrorStatus(error);
 	const requestId = getErrorRequestId(error);
 	const code = getErrorCode(error);
@@ -2081,14 +2249,14 @@ function buildUnauthorizedModelError(error: unknown, chatgptAccountId: string): 
 		.filter(Boolean)
 		.join(' ');
 
-	return new ApplicationError(details);
+	return new OperationalError(details);
 }
 
 function buildModelRequestFailedError(
 	error: unknown,
 	chatgptAccountId: string,
 	debugState?: BoundToolsDebugState,
-): ApplicationError {
+): OperationalError {
 	const status = getErrorStatus(error);
 	const requestId = getErrorRequestId(error);
 	const code = getErrorCode(error);
@@ -2124,12 +2292,6 @@ function buildModelRequestFailedError(
 		debugState?.lastInputPayload ? `input_payload=${debugState.lastInputPayload}` : undefined,
 		debugState?.lastRequestKeys ? `request_keys=${debugState.lastRequestKeys}` : undefined,
 		debugState?.lastReasoning ? `reasoning=${debugState.lastReasoning}` : undefined,
-		debugState?.lastContextMode ? `context_mode=${debugState.lastContextMode}` : undefined,
-		debugState?.lastChainSignature ? `chain_signature=${debugState.lastChainSignature}` : undefined,
-		debugState?.lastSessionKey ? `session_key=${debugState.lastSessionKey}` : undefined,
-		debugState?.lastPreviousResponseId
-			? `previous_response_id=${debugState.lastPreviousResponseId}`
-			: undefined,
 		`normalizer_version=${REQUEST_NORMALIZER_VERSION}`,
 		`node_version=${CODEX_NODE_VERSION}`,
 		`chatgpt_account_id=${chatgptAccountId}`,
@@ -2137,7 +2299,7 @@ function buildModelRequestFailedError(
 		.filter(Boolean)
 		.join(' ');
 
-	return new ApplicationError(details);
+	return new OperationalError(details);
 }
 
 function pickSchemaType(typeValue: unknown): string | undefined {
@@ -2171,6 +2333,7 @@ function sanitizeToolJsonSchema(rawSchema: unknown): Record<string, unknown> {
 		const rawProperties = toObject(schemaObj.properties) ?? {};
 		const properties: Record<string, unknown> = {};
 		for (const [key, value] of Object.entries(rawProperties)) {
+			if (key === '__proto__' || key === 'prototype' || key === 'constructor') continue;
 			properties[key] = sanitizeToolJsonSchema(value);
 		}
 
@@ -2236,8 +2399,7 @@ function supportsParallelToolCalls(
 	modelsCatalog?: ModelsCatalogState,
 ): boolean {
 	if (!ALLOW_PARALLEL_TOOL_CALLS) {
-		// Default to serial tool calls because chatgpt codex backend often rejects
-		// parallel_tool_calls=true for generic n8n tool payloads.
+		// Instance-level compatibility override for deployments that require serial tool calls.
 		return false;
 	}
 
@@ -2248,9 +2410,6 @@ function supportsParallelToolCalls(
 
 	const fromCatalog = getModelRecordFromCatalog(modelsCatalog, normalized);
 	if (fromCatalog) return fromCatalog.supportsParallelToolCalls;
-
-	const known = MODEL_SUPPORTS_PARALLEL_TOOL_CALLS[normalized];
-	if (typeof known === 'boolean') return known;
 
 	// Unknown custom models default to serial tool-calls for compatibility.
 	return false;
@@ -2294,34 +2453,18 @@ function getModelReasoningEfforts(
 
 	const catalogModel = getModelRecordFromCatalog(modelsCatalog, normalized);
 	if (catalogModel && catalogModel.supportedReasoningEfforts.length > 0) {
-		return catalogModel.supportedReasoningEfforts;
+		return catalogModel.supportedReasoningEfforts.map((profile) => profile.effort);
 	}
 
 	return MODEL_REASONING_EFFORTS[normalized];
 }
 
 function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
-	return (
-		value === 'none' ||
-		value === 'minimal' ||
-		value === 'low' ||
-		value === 'medium' ||
-		value === 'high' ||
-		value === 'xhigh'
-	);
+	return value === 'default' || value === 'none' || normalizeModelReasoningEffort(value) === value;
 }
 
 function formatReasoningEffortList(efforts: ReadonlyArray<ModelReasoningEffort>): string {
-	return efforts.map((effort) => REASONING_EFFORT_LABEL[effort]).join(', ');
-}
-
-function buildChainRequestSignature(
-	modelName: string,
-	reasoning: CodexResponsesReasoning | undefined,
-): string {
-	const normalizedModel = normalizeModelName(modelName) ?? modelName.trim().toLowerCase();
-	const reasoningEffort = reasoning?.effort ?? 'none';
-	return `${normalizedModel}|${reasoningEffort}`;
+	return efforts.map((effort) => reasoningEffortLabel(effort)).join(', ');
 }
 
 function isModelSelectionCompatible(requestedModel: string, responseModel: string): boolean {
@@ -2342,7 +2485,7 @@ function assertNoModelSubstitution(
 	if (!responseModel) return;
 	if (isModelSelectionCompatible(requestedModel, responseModel)) return;
 
-	throw new ApplicationError(
+	throw new OperationalError(
 		`Model mismatch: requested "${requestedModel}", backend returned "${responseModel}". This backend substituted the model.`,
 	);
 }
@@ -2375,11 +2518,11 @@ async function refreshChatgptTokens(
 
 	if (refreshResponse.statusCode < 200 || refreshResponse.statusCode > 299) {
 		if (refreshResponse.statusCode === 401) {
-			throw new ApplicationError(buildRefreshFailureMessage(refreshResponse.body));
+			throw new OperationalError(buildRefreshFailureMessage(refreshResponse.body));
 		}
 
 		const detail = extractBackendErrorMessage(refreshResponse.body);
-		throw new ApplicationError(
+		throw new OperationalError(
 			detail
 				? `Token refresh failed with status ${refreshResponse.statusCode}: ${detail}`
 				: `Token refresh failed with status ${refreshResponse.statusCode}`,
@@ -2405,7 +2548,11 @@ async function refreshChatgptTokens(
 
 function resolveAccessToken(auth: CodexAuthJson): string | undefined {
 	const tokens = toObject(auth.tokens) as CodexAuthJson['tokens'] | undefined;
-	return toTrimmed(tokens?.access_token) ?? toTrimmed(auth.OPENAI_API_KEY) ?? toTrimmed(auth.openai_api_key);
+	return (
+		toTrimmed(tokens?.access_token) ??
+		toTrimmed(auth.OPENAI_API_KEY) ??
+		toTrimmed(auth.openai_api_key)
+	);
 }
 
 function resolveAccountId(auth: CodexAuthJson): string | undefined {
@@ -2420,55 +2567,8 @@ function resolveAccountId(auth: CodexAuthJson): string | undefined {
 	);
 }
 
-function normalizeRemoteSupportedReasoningEfforts(value: unknown): ModelReasoningEffort[] {
-	const raw = Array.isArray(value) ? value : [];
-	const normalized: ModelReasoningEffort[] = [];
-
-	for (const entry of raw) {
-		const effortValue =
-			toTrimmed(entry) ?? toTrimmed(toObject(entry)?.effort) ?? toTrimmed(toObject(entry)?.value);
-		const effort = normalizeModelReasoningEffort(effortValue);
-		if (!effort || normalized.includes(effort)) continue;
-		normalized.push(effort);
-	}
-
-	return normalized;
-}
-
 function normalizeRemoteModelInfo(value: unknown): PersistedModelInfo | undefined {
-	const obj = toObject(value);
-	if (!obj) return undefined;
-
-	const slug = normalizeModelName(toTrimmed(obj.slug));
-	if (!slug) return undefined;
-
-	const supportedReasoningEfforts = normalizeRemoteSupportedReasoningEfforts(
-		obj.supported_reasoning_levels,
-	);
-
-	return {
-		slug,
-		displayName: toTrimmed(obj.display_name) ?? FALLBACK_MODEL_NAME_BY_SLUG.get(slug) ?? slug,
-		priority: Math.floor(toFiniteNumber(obj.priority) ?? 10_000),
-		supportedInApi:
-			typeof obj.supported_in_api === 'boolean' ? obj.supported_in_api : true,
-		visibility: normalizeModelVisibility(obj.visibility),
-		supportsParallelToolCalls: Boolean(obj.supports_parallel_tool_calls),
-		supportedReasoningEfforts:
-			supportedReasoningEfforts.length > 0
-				? supportedReasoningEfforts
-				: MODEL_REASONING_EFFORTS[slug]
-					? [...MODEL_REASONING_EFFORTS[slug]]
-					: [],
-		defaultReasoningEffort: defaultReasoningEffortForSupported(
-			supportedReasoningEfforts.length > 0
-				? supportedReasoningEfforts
-				: MODEL_REASONING_EFFORTS[slug]
-					? [...MODEL_REASONING_EFFORTS[slug]]
-					: [],
-			obj.default_reasoning_level,
-		),
-	};
+	return normalizePersistedModelInfo(value);
 }
 
 async function fetchModelsCatalogFromBackend(
@@ -2491,7 +2591,7 @@ async function fetchModelsCatalogFromBackend(
 
 	if (response.statusCode < 200 || response.statusCode > 299) {
 		const detail = extractBackendErrorMessage(response.body);
-		throw new ApplicationError(
+		throw new OperationalError(
 			detail
 				? `Failed to fetch model catalog. status=${response.statusCode} message=${detail}`
 				: `Failed to fetch model catalog. status=${response.statusCode}`,
@@ -2508,7 +2608,7 @@ async function fetchModelsCatalogFromBackend(
 	}
 
 	if (parsedBySlug.size === 0) {
-		throw new ApplicationError('Model catalog response did not include any valid model metadata');
+		throw new OperationalError('Model catalog response did not include any valid model metadata');
 	}
 
 	return mergeWithFallbackCatalog({
@@ -2536,7 +2636,11 @@ async function resolveModelsCatalogForExecution(
 	}
 
 	try {
-		const refreshedCatalog = await fetchModelsCatalogFromBackend(authContext, accessToken, accountId);
+		const refreshedCatalog = await fetchModelsCatalogFromBackend(
+			authContext,
+			accessToken,
+			accountId,
+		);
 		const nextState: RuntimeNodeState = {
 			...loadedState,
 			codexAuthJson: deepCloneAuthJson(auth),
@@ -2583,7 +2687,11 @@ async function resolveModelsCatalogForLoadOptions(
 	}
 
 	try {
-		const refreshedCatalog = await fetchModelsCatalogFromBackend(authContext, accessToken, accountId);
+		const refreshedCatalog = await fetchModelsCatalogFromBackend(
+			authContext,
+			accessToken,
+			accountId,
+		);
 		await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
 			...loadedState,
 			codexAuthJson: deepCloneAuthJson(auth),
@@ -2611,11 +2719,11 @@ type ResolvedAuthState =
 
 function shouldRefreshAuthTokens(auth: CodexAuthJson): boolean {
 	const authTokens = toObject(auth.tokens) as CodexAuthJson['tokens'] | undefined;
-	return Boolean(
-		toTrimmed(authTokens?.refresh_token) &&
-			(isJwtExpiredOrAlmostExpired(toTrimmed(authTokens?.access_token)) ||
-				isLastRefreshStale(toTrimmed(auth.last_refresh))),
-	);
+	if (!toTrimmed(authTokens?.refresh_token)) return false;
+	const accessToken = toTrimmed(authTokens?.access_token);
+	return getJwtExpirationMs(accessToken)
+		? isJwtExpiredOrAlmostExpired(accessToken)
+		: isLastRefreshStale(toTrimmed(auth.last_refresh));
 }
 
 function getRemainingDeviceCodeTtlMs(deviceState: DeviceCodeState): number {
@@ -2640,12 +2748,11 @@ async function resolveNodeAuthState(
 
 		if (!deviceState || isDeviceCodeStateExpired(deviceState)) {
 			deviceState = await requestDeviceCode(authContext);
-				await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
-					codexAuthJson: undefined,
-					codexDeviceAuth: deviceState,
-					sessionConversations: loadedState.sessionConversations,
-					modelsCatalog: loadedState.modelsCatalog,
-				});
+			await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
+				codexAuthJson: undefined,
+				codexDeviceAuth: deviceState,
+				modelsCatalog: loadedState.modelsCatalog,
+			});
 			return {
 				status: 'pending',
 				deviceState,
@@ -2663,12 +2770,11 @@ async function resolveNodeAuthState(
 				: await pollDeviceCode(authContext, deviceState);
 
 		if (pollResult.status === 'pending') {
-				await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
-					codexAuthJson: undefined,
-					codexDeviceAuth: deviceState,
-					sessionConversations: loadedState.sessionConversations,
-					modelsCatalog: loadedState.modelsCatalog,
-				});
+			await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
+				codexAuthJson: undefined,
+				codexDeviceAuth: deviceState,
+				modelsCatalog: loadedState.modelsCatalog,
+			});
 			return {
 				status: 'pending',
 				deviceState,
@@ -2679,20 +2785,19 @@ async function resolveNodeAuthState(
 		const authorizationCode = toTrimmed(pollResult.token.authorization_code);
 		const codeVerifier = toTrimmed(pollResult.token.code_verifier);
 		if (!authorizationCode || !codeVerifier) {
-			throw new ApplicationError('Device-code login returned an invalid authorization payload');
+			throw new OperationalError('Device-code login returned an invalid authorization payload');
 		}
 
 		auth = await exchangeAuthorizationCodeForTokens(authContext, authorizationCode, codeVerifier);
-			await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
-				codexAuthJson: auth,
-				codexDeviceAuth: undefined,
-				sessionConversations: loadedState.sessionConversations,
-				modelsCatalog: loadedState.modelsCatalog,
-			});
+		await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
+			codexAuthJson: auth,
+			codexDeviceAuth: undefined,
+			modelsCatalog: loadedState.modelsCatalog,
+		});
 	}
 
 	if (!auth) {
-		throw new ApplicationError('No valid Codex auth state found. Run device-code login again.');
+		throw new OperationalError('No valid Codex auth state found. Run device-code login again.');
 	}
 
 	if (shouldRefreshAuthTokens(auth)) {
@@ -2702,7 +2807,6 @@ async function resolveNodeAuthState(
 	await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
 		codexAuthJson: auth,
 		codexDeviceAuth: undefined,
-		sessionConversations: loadedState.sessionConversations,
 		modelsCatalog: loadedState.modelsCatalog,
 	});
 
@@ -2718,76 +2822,21 @@ function buildPendingLoginMessage(deviceState: DeviceCodeState, initiated: boole
 		: `Device login pending. Open ${deviceState.verification_url} and enter code ${deviceState.user_code}. Then run this node again.`;
 }
 
-function resolveContextMode(context: ISupplyDataFunctions): ContextMode {
-	const value = context.getNodeParameter('contextMode', 0, DEFAULT_CONTEXT_MODE) as string;
-	return value === 'chain_only' ? 'chain_only' : 'memory_only';
-}
-
-function resolveExplicitSessionKey(context: ISupplyDataFunctions): string | undefined {
-	const rawValue = context.getNodeParameter('sessionKey', 0, '') as string;
-	const sessionKey = toTrimmed(rawValue);
-	if (!sessionKey) return undefined;
-	if (sessionKey.length > MAX_EXPLICIT_SESSION_KEY_LENGTH) {
-		throw new NodeOperationError(
-			context.getNode(),
-			`Session Key exceeds ${MAX_EXPLICIT_SESSION_KEY_LENGTH} characters.`,
-		);
-	}
-	return sessionKey;
-}
-
-function getPreviousResponseIdForSession(
-	state: RuntimeNodeState,
-	sessionKey: string,
-	requestSignature: string,
-): string | undefined {
-	const sessionState = state.sessionConversations?.[sessionKey];
-	const previousResponseId = toTrimmed(sessionState?.previousResponseId);
-	if (!previousResponseId) return undefined;
-
-	const storedSignature = toTrimmed(sessionState?.requestSignature);
-	if (!storedSignature || storedSignature !== requestSignature) {
-		return undefined;
-	}
-
-	return previousResponseId;
-}
-
-function upsertSessionConversationState(
-	state: RuntimeNodeState,
-	sessionKey: string,
-	previousResponseId: string,
-	requestSignature: string,
-): RuntimeNodeState {
-	const normalizedResponseId = toTrimmed(previousResponseId);
-	const normalizedRequestSignature = toTrimmed(requestSignature);
-	if (!normalizedResponseId || !normalizedRequestSignature) return state;
-
-	const currentConversations = state.sessionConversations ?? {};
-	const nextConversations: Record<string, SessionConversationState> = {
-		...currentConversations,
-		[sessionKey]: {
-			previousResponseId: normalizedResponseId,
-			requestSignature: normalizedRequestSignature,
-			updatedAt: new Date().toISOString(),
-		},
-	};
-
-	return {
-		...state,
-		sessionConversations: nextConversations,
-	};
-}
-
-function resolveConfiguredModelName(context: ISupplyDataFunctions): { modelName: string } {
-	const selectedModel = context.getNodeParameter('model', 0, DEFAULT_MODEL) as string;
-	const customModel = context.getNodeParameter('customModel', 0, '') as string;
+function resolveConfiguredModelName(
+	context: ISupplyDataFunctions,
+	itemIndex: number,
+): { modelName: string } {
+	const selectedModel = context.getNodeParameter('model', itemIndex, DEFAULT_MODEL) as string;
+	const customModel = context.getNodeParameter('customModel', itemIndex, '') as string;
 	const modelName = resolveEffectiveModelName(selectedModel, customModel);
 
 	return { modelName };
 }
 
-function resolveEffectiveModelName(selectedModel: string | undefined, customModel: string | undefined): string {
+function resolveEffectiveModelName(
+	selectedModel: string | undefined,
+	customModel: string | undefined,
+): string {
 	const selected = toTrimmed(selectedModel);
 	if (selected === CUSTOM_MODEL_VALUE) {
 		return normalizeModelName(customModel) ?? DEFAULT_MODEL;
@@ -2799,21 +2848,13 @@ function resolveReasoningConfig(
 	context: ISupplyDataFunctions,
 	modelName: string,
 	modelsCatalog: ModelsCatalogState,
+	itemIndex: number,
 ): CodexResponsesReasoning | undefined {
-	let selectedReasoningEffort = context.getNodeParameter(
+	const selectedReasoningEffort = context.getNodeParameter(
 		'reasoningEffort',
-		0,
+		itemIndex,
 		DEFAULT_REASONING_EFFORT,
 	) as CodexReasoningEffort;
-
-	// Backward compatibility for older workflow definitions.
-	if (!selectedReasoningEffort) {
-		selectedReasoningEffort = context.getNodeParameter(
-			'reasoningEffort',
-			0,
-			DEFAULT_REASONING_EFFORT,
-		) as CodexReasoningEffort;
-	}
 
 	if (!isCodexReasoningEffort(selectedReasoningEffort)) {
 		throw new NodeOperationError(
@@ -2822,29 +2863,91 @@ function resolveReasoningConfig(
 		);
 	}
 
-	if (selectedReasoningEffort === 'none') {
-		return undefined;
-	}
-
+	const modelInfo = getModelRecordFromCatalog(modelsCatalog, modelName);
 	const supportedEfforts = getModelReasoningEfforts(modelName, modelsCatalog);
-	if (!supportedEfforts) {
+	const resolvedEffort =
+		selectedReasoningEffort === 'default'
+			? modelInfo?.defaultReasoningEffort === 'none'
+				? undefined
+				: modelInfo?.defaultReasoningEffort
+			: selectedReasoningEffort === 'none'
+				? undefined
+				: selectedReasoningEffort;
+
+	if (resolvedEffort && !supportedEfforts) {
 		throw new NodeOperationError(
 			context.getNode(),
-			`Model "${modelName}" does not have a verified reasoning-effort profile. Select a listed model or set Reasoning Effort to None.`,
+			`Model "${modelName}" does not have a verified reasoning-effort profile. Select a listed model or use Model Default/None.`,
 		);
 	}
 
-	if (!supportedEfforts.includes(selectedReasoningEffort)) {
+	if (resolvedEffort && supportedEfforts && !supportedEfforts.includes(resolvedEffort)) {
 		throw new NodeOperationError(
 			context.getNode(),
-			`Reasoning Effort "${REASONING_EFFORT_LABEL[selectedReasoningEffort]}" is not supported by model "${modelName}". Supported: ${formatReasoningEffortList(supportedEfforts)}.`,
+			`Reasoning Effort "${reasoningEffortLabel(resolvedEffort)}" is not supported by model "${modelName}". Supported: ${formatReasoningEffortList(supportedEfforts)}.`,
 		);
 	}
 
+	const selectedSummary = context.getNodeParameter(
+		'reasoningSummary',
+		itemIndex,
+		'default',
+	) as string;
+	const resolvedSummary =
+		selectedSummary === 'default'
+			? modelInfo?.defaultReasoningSummary
+			: normalizeReasoningSummary(selectedSummary);
+	if (resolvedSummary !== 'none' && modelInfo && !modelInfo.supportsReasoningSummary) {
+		throw new NodeOperationError(
+			context.getNode(),
+			`Model "${modelName}" does not support reasoning summaries.`,
+		);
+	}
+
+	if (!resolvedEffort && (!resolvedSummary || resolvedSummary === 'none')) return undefined;
 	return {
-		effort: selectedReasoningEffort,
-		summary: 'auto',
+		...(resolvedEffort ? { effort: resolvedEffort } : {}),
+		...(resolvedSummary && resolvedSummary !== 'none' ? { summary: resolvedSummary } : {}),
 	};
+}
+
+function resolveVerbosity(
+	context: ISupplyDataFunctions,
+	modelName: string,
+	modelsCatalog: ModelsCatalogState,
+	itemIndex: number,
+): CodexVerbosity | undefined {
+	const selected = context.getNodeParameter('verbosity', itemIndex, 'default') as string;
+	const modelInfo = getModelRecordFromCatalog(modelsCatalog, modelName);
+	if (selected === 'default')
+		return modelInfo?.supportsVerbosity ? modelInfo.defaultVerbosity : undefined;
+	const verbosity = normalizeVerbosity(selected);
+	if (!verbosity) return undefined;
+	if (modelInfo && !modelInfo.supportsVerbosity) {
+		throw new NodeOperationError(
+			context.getNode(),
+			`Model "${modelName}" does not support verbosity.`,
+		);
+	}
+	return verbosity;
+}
+
+function resolveServiceTier(
+	context: ISupplyDataFunctions,
+	modelName: string,
+	modelsCatalog: ModelsCatalogState,
+	itemIndex: number,
+): string | undefined {
+	const selected = toTrimmed(context.getNodeParameter('serviceTier', itemIndex, 'default'));
+	const modelInfo = getModelRecordFromCatalog(modelsCatalog, modelName);
+	if (!selected || selected === 'default') return modelInfo?.defaultServiceTier;
+	if (modelInfo && !modelInfo.serviceTiers.some((tier) => tier.id === selected)) {
+		throw new NodeOperationError(
+			context.getNode(),
+			`Service Tier "${selected}" is not supported by model "${modelName}".`,
+		);
+	}
+	return selected;
 }
 
 // eslint-disable-next-line @n8n/community-nodes/node-usable-as-tool
@@ -2852,9 +2955,13 @@ export class OpenAiCodexChatModel implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'OpenAI codex',
 		name: 'openAiCodexChatModel',
-		icon: { light: 'file:../../icons/openAiCodex.svg', dark: 'file:../../icons/openAiCodex.dark.svg' },
+		icon: {
+			light: 'file:../../icons/openAiCodex.svg',
+			dark: 'file:../../icons/openAiCodex.dark.svg',
+		},
 		group: ['transform'],
 		version: [1],
+		subtitle: '={{ $parameter.model }}',
 		description: 'Codex chat model using ChatGPT Codex backend with built-in device-code auth',
 		defaults: {
 			name: 'OpenAI codex',
@@ -2916,41 +3023,6 @@ export class OpenAiCodexChatModel implements INodeType {
 				description: 'Custom model slug',
 			},
 			{
-				displayName: 'Context Mode',
-				name: 'contextMode',
-				type: 'options',
-				default: DEFAULT_CONTEXT_MODE,
-					options: [
-						{
-							name: 'Memory Only (N8N Memory)',
-							value: 'memory_only',
-							description:
-								'Do not use previous_response_id. Context is provided by n8n Agent/Memory.',
-						},
-						{
-							name: 'Backend Chain (Previous Response ID)',
-							value: 'chain_only',
-							description:
-								'Use previous_response_id chaining keyed by Session Key. Do not use Memory replay.',
-					},
-				],
-				description: 'Choose exactly one context strategy to avoid double-context behavior',
-			},
-			{
-				displayName: 'Session Key',
-				name: 'sessionKey',
-				type: 'string',
-				default: '',
-				placeholder: '={{ $json.sessionId }}',
-				displayOptions: {
-					show: {
-						contextMode: ['chain_only'],
-					},
-				},
-				description:
-					'Required for Backend Chain mode. Use a stable key (for example user ID or session ID) so previous_response_id chaining can continue.',
-			},
-			{
 				displayName: 'Reasoning Effort Name or ID',
 				name: 'reasoningEffort',
 				type: 'options',
@@ -2958,6 +3030,46 @@ export class OpenAiCodexChatModel implements INodeType {
 				options: reasoningEffortOptions(ALL_REASONING_EFFORTS),
 				typeOptions: {
 					loadOptionsMethod: 'getCodexReasoningEffortOptions',
+					loadOptionsDependsOn: ['model', 'customModel'],
+				},
+				description:
+					'Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>',
+			},
+			{
+				displayName: 'Reasoning Summary',
+				name: 'reasoningSummary',
+				type: 'options',
+				default: 'default',
+				options: [
+					{ name: 'Auto', value: 'auto' },
+					{ name: 'Concise', value: 'concise' },
+					{ name: 'Detailed', value: 'detailed' },
+					{ name: 'Model Default', value: 'default' },
+					{ name: 'None', value: 'none' },
+				],
+				description: 'Controls the reasoning summary returned by models that support it',
+			},
+			{
+				displayName: 'Verbosity',
+				name: 'verbosity',
+				type: 'options',
+				default: 'default',
+				options: [
+					{ name: 'High', value: 'high' },
+					{ name: 'Low', value: 'low' },
+					{ name: 'Medium', value: 'medium' },
+					{ name: 'Model Default', value: 'default' },
+				],
+				description: 'Controls response verbosity for models that support it',
+			},
+			{
+				displayName: 'Service Tier Name or ID',
+				name: 'serviceTier',
+				type: 'options',
+				default: 'default',
+				options: [{ name: 'Model Default', value: 'default' }],
+				typeOptions: {
+					loadOptionsMethod: 'getCodexServiceTierOptions',
 					loadOptionsDependsOn: ['model', 'customModel'],
 				},
 				description:
@@ -2980,7 +3092,34 @@ export class OpenAiCodexChatModel implements INodeType {
 				const customModel = this.getCurrentNodeParameter('customModel') as string | undefined;
 				const modelName = resolveEffectiveModelName(selectedModel, customModel);
 				const supportedEfforts = getModelReasoningEfforts(modelName, catalog) ?? [];
-				return reasoningEffortOptions(supportedEfforts);
+				const modelInfo = getModelRecordFromCatalog(catalog, modelName);
+				const descriptions = new Map(
+					(modelInfo?.supportedReasoningEfforts ?? []).map((profile) => [
+						profile.effort,
+						profile.description,
+					]),
+				);
+				return reasoningEffortOptions(supportedEfforts).map((option) => {
+					const description = descriptions.get(String(option.value));
+					return description ? { ...option, description } : option;
+				});
+			},
+			async getCodexServiceTierOptions(
+				this: ILoadOptionsFunctions,
+			): Promise<INodePropertyOptions[]> {
+				const catalog = await resolveModelsCatalogForLoadOptions(this);
+				const selectedModel = this.getCurrentNodeParameter('model') as string | undefined;
+				const customModel = this.getCurrentNodeParameter('customModel') as string | undefined;
+				const modelName = resolveEffectiveModelName(selectedModel, customModel);
+				const modelInfo = getModelRecordFromCatalog(catalog, modelName);
+				return [
+					{ name: 'Model Default', value: 'default' },
+					...(modelInfo?.serviceTiers ?? []).map((tier) => ({
+						name: tier.name,
+						value: tier.id,
+						...(tier.description ? { description: tier.description } : {}),
+					})),
+				];
 			},
 		},
 	};
@@ -3000,7 +3139,9 @@ export class OpenAiCodexChatModel implements INodeType {
 			);
 
 			if (resolved.status === 'pending') {
-				return [this.helpers.returnJsonArray(buildPendingVerificationPayload(resolved.deviceState))];
+				return [
+					this.helpers.returnJsonArray(buildPendingVerificationPayload(resolved.deviceState)),
+				];
 			}
 
 			return [
@@ -3008,15 +3149,22 @@ export class OpenAiCodexChatModel implements INodeType {
 					status: 'authenticated',
 					chatgpt_account_id: resolveAccountId(resolved.auth) ?? null,
 					last_refresh: toTrimmed(resolved.auth.last_refresh) ?? null,
-					conversation_id: null,
 				}),
 			];
 		} catch (error) {
+			if (this.continueOnFail()) {
+				return [
+					this.helpers.returnJsonArray({
+						status: 'error',
+						error: error instanceof Error ? error.message : String(error),
+					}),
+				];
+			}
 			throw new NodeOperationError(this.getNode(), error as Error);
 		}
 	}
 
-	async supplyData(this: ISupplyDataFunctions) {
+	async supplyData(this: ISupplyDataFunctions, itemIndex: number) {
 		try {
 			const runtimeStateKey = getRuntimeStateKey(this as unknown as RuntimeStateContext);
 			const stateContext = this as unknown as PersistedStateContext;
@@ -3053,39 +3201,20 @@ export class OpenAiCodexChatModel implements INodeType {
 				);
 			}
 
-				const modelsCatalog = await resolveModelsCatalogForExecution(
-					stateContext,
-					authContext,
-					runtimeStateKey,
-					nodeStaticData,
-					resolved.auth,
-				);
-				const { modelName } = resolveConfiguredModelName(this);
-				const reasoningConfig = resolveReasoningConfig(this, modelName, modelsCatalog);
-			const chainRequestSignature = buildChainRequestSignature(modelName, reasoningConfig);
-			const contextMode = resolveContextMode(this);
-			const explicitSessionKey =
-				contextMode === 'chain_only' ? resolveExplicitSessionKey(this) : undefined;
-			if (contextMode === 'chain_only' && !explicitSessionKey) {
-				throw new NodeOperationError(
-					this.getNode(),
-					'Session Key is required when Context Mode is Backend Chain (previous_response_id).',
-				);
-			}
-			const latestState = await loadNodeState(stateContext, runtimeStateKey, nodeStaticData);
-			const previousResponseId = contextMode === 'chain_only' && explicitSessionKey
-				? getPreviousResponseIdForSession(
-						latestState,
-						explicitSessionKey,
-						chainRequestSignature,
-					)
-				: undefined;
+			const modelsCatalog = await resolveModelsCatalogForExecution(
+				stateContext,
+				authContext,
+				runtimeStateKey,
+				nodeStaticData,
+				resolved.auth,
+			);
+			const { modelName } = resolveConfiguredModelName(this, itemIndex);
+			const modelInfo = getModelRecordFromCatalog(modelsCatalog, modelName);
+			const reasoningConfig = resolveReasoningConfig(this, modelName, modelsCatalog, itemIndex);
+			const verbosity = resolveVerbosity(this, modelName, modelsCatalog, itemIndex);
+			const serviceTier = resolveServiceTier(this, modelName, modelsCatalog, itemIndex);
 			const boundToolsDebugState: BoundToolsDebugState = {
 				toolNames: [],
-				lastContextMode: contextMode,
-				lastChainSignature: chainRequestSignature,
-				lastSessionKey: explicitSessionKey,
-				lastPreviousResponseId: previousResponseId,
 			};
 			const baseHeaders = {
 				Authorization: `Bearer ${token}`,
@@ -3094,33 +3223,37 @@ export class OpenAiCodexChatModel implements INodeType {
 			};
 
 			const codexModel = new CodexResponsesChatModel(modelName, {
-				baseUrl: DEFAULT_CHATGPT_CODEX_BASE_URL,
 				baseHeaders,
-				contextMode,
-				defaultInstructions: DEFAULT_INSTRUCTIONS,
+				defaultInstructions: modelInfo?.baseInstructions ?? DEFAULT_INSTRUCTIONS,
 				reasoning: reasoningConfig,
-					parallelToolCalls: supportsParallelToolCalls(modelName, modelsCatalog),
-				sessionKey: explicitSessionKey,
-				previousResponseId,
-				savePreviousResponseId: explicitSessionKey
-					? async (sessionKey: string, responseId: string) => {
-							const currentState = await loadNodeState(
-								stateContext,
-								runtimeStateKey,
-								nodeStaticData,
-							);
-								const updatedState = upsertSessionConversationState(
-									currentState,
-									sessionKey,
-									responseId,
-									chainRequestSignature,
-								);
-							await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, updatedState);
-						}
-					: undefined,
+				verbosity,
+				serviceTier,
+				parallelToolCalls: supportsParallelToolCalls(modelName, modelsCatalog),
+				useResponsesLite: modelInfo?.useResponsesLite ?? false,
+				refreshAuthHeaders: async () => {
+					const currentState = await loadNodeState(stateContext, runtimeStateKey, nodeStaticData);
+					if (!currentState.codexAuthJson) {
+						throw new OperationalError('Codex auth state is unavailable for token refresh');
+					}
+					const refreshedAuth = await refreshChatgptTokens(authContext, currentState.codexAuthJson);
+					await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
+						...currentState,
+						codexAuthJson: refreshedAuth,
+						codexDeviceAuth: undefined,
+					});
+					const refreshedToken = resolveAccessToken(refreshedAuth);
+					const refreshedAccountId = resolveAccountId(refreshedAuth);
+					if (!refreshedToken || !refreshedAccountId) {
+						throw new OperationalError('Token refresh did not produce usable Codex auth state');
+					}
+					return {
+						Authorization: `Bearer ${refreshedToken}`,
+						...resolveDefaultHeaders(refreshedAccountId),
+					};
+				},
 				chatgptAccountId,
 				debugState: boundToolsDebugState,
-				openStreamRequest: async (request, headers) => {
+				openStreamRequest: async (request, headers, config) => {
 					const response = (await this.helpers.httpRequest({
 						method: 'POST',
 						url: `${DEFAULT_CHATGPT_CODEX_BASE_URL}/responses`,
@@ -3130,6 +3263,8 @@ export class OpenAiCodexChatModel implements INodeType {
 						encoding: 'stream',
 						ignoreHttpStatusErrors: true,
 						returnFullResponse: true,
+						...(typeof config?.timeout === 'number' ? { timeout: config.timeout } : {}),
+						...(config?.abortSignal ? { abortSignal: config.abortSignal } : {}),
 					})) as IN8nHttpFullResponse;
 
 					return response;
