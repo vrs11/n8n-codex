@@ -16,6 +16,7 @@ import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import packageJson from '../../package.json';
+import fallbackModels from './fallback-models.json';
 import type {
 	IDataObject,
 	IExecuteFunctions,
@@ -144,41 +145,27 @@ type CodexVerbosity = 'low' | 'medium' | 'high';
 const CUSTOM_MODEL_VALUE = '__custom__';
 
 const MODEL_OPTIONS: INodePropertyOptions[] = [
-	{
-		name: 'Custom',
-		value: CUSTOM_MODEL_VALUE,
-	},
-	{
-		name: 'GPT-5.6-Sol',
-		value: 'gpt-5.6-sol',
-	},
-	{
-		name: 'GPT-5.6-Terra',
-		value: 'gpt-5.6-terra',
-	},
-	{
-		name: 'GPT-5.6-Luna',
-		value: 'gpt-5.6-luna',
-	},
-	{
-		name: 'GPT-5.5',
-		value: 'gpt-5.5',
-	},
-	{
-		name: 'GPT-5.2',
-		value: 'gpt-5.2',
-	},
+	{ name: 'Custom', value: CUSTOM_MODEL_VALUE },
+	...fallbackModels.models
+		.filter((model) => model.visibility === 'list')
+		.map((model) => ({
+			name: model.display_name,
+			value: model.slug,
+		})),
 ];
 
 const FALLBACK_MODEL_NAME_BY_SLUG = new Map(
-	MODEL_OPTIONS.map((option) => [String(option.value).trim().toLowerCase(), option.name]),
+	fallbackModels.models.map((model) => [model.slug, model.display_name]),
 );
 
 const MODEL_REASONING_EFFORTS: Readonly<Record<string, ReadonlyArray<ModelReasoningEffort>>> = {
-	'gpt-5.6-sol': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
-	'gpt-5.6-terra': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
-	'gpt-5.6-luna': ['low', 'medium', 'high', 'xhigh', 'max'],
-	'gpt-5.5': ['low', 'medium', 'high', 'xhigh'],
+	...Object.fromEntries(
+		fallbackModels.models.map((model) => [
+			model.slug,
+			model.supported_reasoning_levels.map((profile) => profile.effort),
+		]),
+	),
+	// Preserve validation for saved workflows using models removed from the CLI picker.
 	'gpt-5.4': ['low', 'medium', 'high', 'xhigh'],
 	'gpt-5.4-mini': ['low', 'medium', 'high', 'xhigh'],
 	'gpt-5.2': ['low', 'medium', 'high', 'xhigh'],
@@ -235,11 +222,12 @@ const DEVICE_CODE_USERCODE_URL = `${AUTH_ISSUER}/api/accounts/deviceauth/usercod
 const DEVICE_CODE_TOKEN_URL = `${AUTH_ISSUER}/api/accounts/deviceauth/token`;
 const DEVICE_CODE_VERIFICATION_URL = `${AUTH_ISSUER}/codex/device`;
 const DEVICE_CODE_CALLBACK_URL = `${AUTH_ISSUER}/deviceauth/callback`;
-const DEFAULT_MODEL = 'gpt-5.6-sol';
+const DEFAULT_MODEL = 'gpt-6.1-sol';
+const LEGACY_DEFAULT_MODEL = 'gpt-5.6-sol';
 const TOKEN_REFRESH_INTERVAL_DAYS = 8;
 const DEVICE_CODE_EXPIRY_MS = 15 * 60 * 1000;
 const CODEX_NODE_VERSION = toTrimmed(packageJson.version) ?? '0.0.0';
-const MODELS_CLIENT_VERSION = toTrimmed(process.env.N8N_OPENAI_CODEX_CLIENT_VERSION) ?? '0.145.0';
+const MODELS_CLIENT_VERSION = toTrimmed(process.env.N8N_OPENAI_CODEX_CLIENT_VERSION) ?? '0.162.1';
 const CODEX_USER_AGENT = `${DEFAULT_ORIGINATOR}/${MODELS_CLIENT_VERSION} (n8n-openai-codex/${CODEX_NODE_VERSION})`;
 const PERSISTED_STATE_PREFIX = '.openai-codex-state';
 const DIRECT_PERSIST_DIR_ENV = 'N8N_OPENAI_CODEX_STATE_DIR';
@@ -247,7 +235,7 @@ const ALLOW_PARALLEL_TOOL_CALLS =
 	toTrimmed(process.env.N8N_OPENAI_CODEX_ALLOW_PARALLEL_TOOLS) !== 'false';
 const MODEL_CATALOG_CACHE_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_INSTRUCTIONS = 'You are Codex.';
-const REQUEST_NORMALIZER_VERSION = '2026-07-18.1';
+const REQUEST_NORMALIZER_VERSION = '2026-10-15.1';
 
 type CodexResponsesMessageContentItem =
 	| {
@@ -258,18 +246,21 @@ type CodexResponsesMessageContentItem =
 			type: 'input_image';
 			image_url: string;
 			detail?: 'auto';
-	  };
+	  }
+	| { type: 'input_audio'; audio_url: string };
 
 type CodexResponsesInputItem =
 	| {
 			type: 'message';
 			role: 'user' | 'assistant' | 'developer';
 			content: CodexResponsesMessageContentItem[];
+			phase?: string;
 	  }
 	| {
 			type: 'function_call';
 			call_id: string;
 			name: string;
+			namespace?: string;
 			arguments: string;
 	  }
 	| {
@@ -280,8 +271,16 @@ type CodexResponsesInputItem =
 	| {
 			type: 'additional_tools';
 			role: 'developer';
-			tools: CodexResponsesTool[];
-	  };
+			tools: CodexResponsesToolNamespace[];
+	  }
+	| { type: 'reasoning'; summary: unknown[]; encrypted_content: string };
+
+type CodexResponsesToolNamespace = {
+	type: 'namespace';
+	name: 'functions';
+	description: string;
+	tools: CodexResponsesTool[];
+};
 
 type CodexResponsesTool = {
 	type: 'function';
@@ -299,7 +298,6 @@ type CodexResponsesReasoning = {
 
 type CodexResponsesRequest = {
 	model: string;
-	instructions?: string;
 	input: CodexResponsesInputItem[];
 	tools?: CodexResponsesTool[];
 	tool_choice: 'auto';
@@ -321,6 +319,10 @@ type CodexResponsesOutputItem = {
 	call_id?: string;
 	name?: string;
 	arguments?: string;
+	namespace?: string;
+	phase?: string;
+	summary?: unknown[];
+	encrypted_content?: string;
 };
 
 type CodexResponsesResponse = {
@@ -349,6 +351,9 @@ type CodexResponsesResponse = {
 type CodexStreamEvent = {
 	type?: string;
 	headers?: Record<string, unknown>;
+	error?: { message?: string; code?: string };
+	message?: string;
+	code?: string;
 	delta?: string;
 	output_index?: number;
 	item?: Record<string, unknown>;
@@ -393,7 +398,9 @@ async function* parseCodexStreamEvents(
 		try {
 			yield JSON.parse(message.data) as CodexStreamEvent;
 		} catch {
-			// ignore malformed events
+			// Stream helpers have no node context for constructing NodeOperationError.
+			// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
+			throw new OperationalError('Codex returned a malformed stream event');
 		}
 	}
 }
@@ -472,7 +479,7 @@ function parseCodexOutputItems(outputItems: unknown): {
 				const blockObj = toObject(block);
 				if (!blockObj) continue;
 				if (toTrimmed(blockObj.type) === 'output_text') {
-					const text = toTrimmed(blockObj.text);
+					const text = toStringValue(blockObj.text);
 					if (text) textParts.push(text);
 				}
 			}
@@ -497,7 +504,7 @@ function parseCodexOutputItems(outputItems: unknown): {
 
 function toCodexOutputText(part: MessageContent): string | undefined {
 	if (part.type === 'text' || part.type === 'reasoning') {
-		return toTrimmed(part.text);
+		return toStringValue(part.text);
 	}
 
 	if (part.type === 'provider') {
@@ -515,20 +522,28 @@ function toCodexInputMedia(part: MessageContent): CodexResponsesMessageContentIt
 	if (part.type !== 'file') return undefined;
 
 	const mediaType = toTrimmed(part.mediaType)?.toLowerCase();
-	if (mediaType?.startsWith('audio/')) {
-		return {
-			type: 'input_text',
-			text: 'Codex does not support audio input yet.',
-		};
-	}
-	if (!mediaType?.startsWith('image/')) return undefined;
+	if (!mediaType?.startsWith('image/') && !mediaType?.startsWith('audio/')) return undefined;
 
+	const remoteUrl = toTrimmed(part.providerMetadata?.url);
 	const rawData =
-		typeof part.data === 'string' ? part.data : Buffer.from(part.data).toString('base64');
-	const imageUrl = rawData.startsWith('data:') ? rawData : `data:${mediaType};base64,${rawData}`;
+		typeof part.data === 'string'
+			? part.data
+			: part.data
+				? Buffer.from(part.data).toString('base64')
+				: undefined;
+	const mediaUrl =
+		remoteUrl ??
+		(rawData?.startsWith('data:')
+			? rawData
+			: rawData
+				? `data:${mediaType};base64,${rawData}`
+				: undefined);
+	if (!mediaUrl) throw new OperationalError('Codex media input is missing data or a URL');
+	if (mediaType.startsWith('audio/')) return { type: 'input_audio', audio_url: mediaUrl };
+
 	return {
 		type: 'input_image',
-		image_url: imageUrl,
+		image_url: mediaUrl,
 		detail: 'auto',
 	};
 }
@@ -590,7 +605,36 @@ function toCodexInput(
 		}
 
 		if (message.role === 'assistant') {
+			const hasReplayMessages = message.content.some(
+				(part) =>
+					part.type === 'provider' && toObject(part.value.codexMessageItem)?.type === 'message',
+			);
 			for (const part of message.content) {
+				if (part.type === 'provider') {
+					const replayMessage = toObject(part.value.codexMessageItem);
+					if (
+						replayMessage?.type === 'message' &&
+						replayMessage.role === 'assistant' &&
+						Array.isArray(replayMessage.content)
+					) {
+						input.push({
+							type: 'message',
+							role: 'assistant',
+							content: replayMessage.content as CodexResponsesMessageContentItem[],
+							...(typeof replayMessage.phase === 'string' ? { phase: replayMessage.phase } : {}),
+						});
+					}
+					const item = toObject(part.value.codexReasoningItem);
+					if (item?.type === 'reasoning' && typeof item.encrypted_content === 'string') {
+						input.push({
+							type: 'reasoning',
+							summary: Array.isArray(item.summary) ? item.summary : [],
+							encrypted_content: item.encrypted_content,
+						});
+					}
+					continue;
+				}
+				if (part.type === 'reasoning' || (part.type === 'text' && hasReplayMessages)) continue;
 				if (part.type === 'tool-call') {
 					const name = toTrimmed(part.toolName);
 					if (!name) continue;
@@ -713,6 +757,78 @@ function normalizeCodexToolParameters(rawSchema: unknown): Record<string, unknow
 	};
 }
 
+function codexReplayContent(items: CodexResponsesOutputItem[]): MessageContent[] {
+	const content: MessageContent[] = [];
+	for (const item of items) {
+		if (item.type === 'reasoning' && item.encrypted_content) {
+			content.push({
+				type: 'provider',
+				value: {
+					codexReasoningItem: {
+						type: 'reasoning',
+						summary: item.summary ?? [],
+						encrypted_content: item.encrypted_content,
+					},
+				},
+			});
+		} else if (item.type === 'message' && item.role === 'assistant' && item.content) {
+			content.push({
+				type: 'provider',
+				value: {
+					codexMessageItem: {
+						type: 'message',
+						role: 'assistant',
+						content: item.content,
+						...(item.phase ? { phase: item.phase } : {}),
+					},
+				},
+			});
+		}
+	}
+	return content;
+}
+
+function terminalCodexResponse(event: CodexStreamEvent): CodexResponsesResponse | undefined {
+	if (!event.response) return undefined;
+	return {
+		...event.response,
+		status:
+			event.type === 'response.failed'
+				? 'failed'
+				: event.type === 'response.incomplete'
+					? 'incomplete'
+					: (event.response.status ?? 'completed'),
+	};
+}
+
+function assertCodexStreamEvent(event: CodexStreamEvent): void {
+	if (event.type !== 'error') return;
+	const detail =
+		toTrimmed(event.error?.message) ??
+		toTrimmed(event.message) ??
+		toTrimmed(event.error?.code) ??
+		toTrimmed(event.code);
+	throw new OperationalError(detail ? `Codex stream failed: ${detail}` : 'Codex stream failed');
+}
+
+async function readCodexErrorBody(body: unknown): Promise<unknown> {
+	if (!isAsyncBufferIterable(body)) return body;
+	const chunks: Buffer[] = [];
+	let size = 0;
+	for await (const chunk of body) {
+		const buffer = Buffer.from(chunk);
+		chunks.push(buffer.subarray(0, Math.max(0, 65536 - size)));
+		size += buffer.length;
+		if (size >= 65536) break;
+	}
+	const text = Buffer.concat(chunks).toString('utf8');
+	try {
+		return JSON.parse(text);
+	} catch {
+		return text;
+	}
+}
+
 function assertSuccessfulCodexResponse(response: CodexResponsesResponse | undefined): void {
 	if (!response) {
 		throw new OperationalError('Codex response stream ended before a terminal event');
@@ -772,50 +888,46 @@ class CodexResponsesChatModel extends BaseChatModel {
 		const normalizedInput = toCodexInput(messages);
 		const instructions = normalizedInput.instructions ?? this.config.defaultInstructions;
 		const input = [...normalizedInput.input];
+		const prefix: CodexResponsesInputItem[] = [];
 		if (this.config.useResponsesLite) {
 			for (const item of input) {
+				if (item.type === 'function_call') item.namespace = 'functions';
 				if (item.type !== 'message') continue;
 				for (const contentItem of item.content) {
 					if (contentItem.type === 'input_image') delete contentItem.detail;
 				}
 			}
-			const prefix: CodexResponsesInputItem[] = [
-				{
+			if (tools.length > 0)
+				prefix.push({
 					type: 'additional_tools',
 					role: 'developer',
-					tools,
-				},
-			];
-			if (instructions) {
-				prefix.push({
-					type: 'message',
-					role: 'developer',
-					content: [{ type: 'input_text', text: instructions }],
+					tools: [{ type: 'namespace', name: 'functions', description: '', tools }],
 				});
-			}
-			input.unshift(...prefix);
 		}
-
-		const reasoning = this.config.reasoning
-			? {
-					...this.config.reasoning,
-					...(this.config.useResponsesLite ? { context: 'all_turns' as const } : {}),
-				}
-			: undefined;
+		if (instructions)
+			prefix.push({
+				type: 'message',
+				role: 'developer',
+				content: [{ type: 'input_text', text: instructions }],
+			});
+		input.unshift(...prefix);
+		const reasoning: CodexResponsesReasoning = {
+			...this.config.reasoning,
+			...(this.config.useResponsesLite ? { context: 'all_turns' as const } : {}),
+		};
 
 		const request: CodexResponsesRequest = {
 			model: this.modelId,
-			...(this.config.useResponsesLite ? {} : { instructions }),
+			stream: true,
+			...(this.config.serviceTier ? { service_tier: this.config.serviceTier } : {}),
 			input,
 			...(this.config.useResponsesLite ? {} : { tools }),
 			tool_choice: 'auto',
 			parallel_tool_calls: this.config.parallelToolCalls && !this.config.useResponsesLite,
-			stream: true,
 			store: false,
 			include: ['reasoning.encrypted_content'],
 			prompt_cache_key: this.sessionId,
 			...(reasoning ? { reasoning } : {}),
-			...(this.config.serviceTier ? { service_tier: this.config.serviceTier } : {}),
 			...(this.config.verbosity ? { text: { verbosity: this.config.verbosity } } : {}),
 			client_metadata: {
 				'x-codex-installation-id': this.installationId,
@@ -852,7 +964,9 @@ class CodexResponsesChatModel extends BaseChatModel {
 		);
 
 		if (response.statusCode === 401) {
+			await readCodexErrorBody(response.body);
 			const refreshedHeaders = await this.config.refreshAuthHeaders();
+			Object.assign(this.config.baseHeaders, refreshedHeaders);
 			response = await this.config.openStreamRequest(
 				request,
 				{
@@ -864,14 +978,15 @@ class CodexResponsesChatModel extends BaseChatModel {
 		}
 
 		if (response.statusCode < 200 || response.statusCode > 299) {
+			const responseBody = await readCodexErrorBody(response.body);
 			const errorPayload = {
 				status: response.statusCode,
 				message:
-					extractBackendErrorMessage(response.body) ??
+					extractBackendErrorMessage(responseBody) ??
 					`${response.statusCode} status code (no body)`,
 				response: {
 					status: response.statusCode,
-					data: response.body,
+					data: responseBody,
 				},
 			};
 			if (response.statusCode === 401) {
@@ -888,6 +1003,9 @@ class CodexResponsesChatModel extends BaseChatModel {
 			throw new OperationalError('Codex backend did not return a stream body');
 		}
 
+		assertNoModelSubstitution(this.modelId, {
+			model: getReportedModelFromHeaders(response.headers),
+		});
 		return response.body;
 	}
 
@@ -903,10 +1021,12 @@ class CodexResponsesChatModel extends BaseChatModel {
 			argumentsRaw: string;
 		}> = [];
 		const toolCallBuffers: Record<number, { id: string; name: string; argumentsRaw: string }> = {};
+		const doneItems: CodexResponsesOutputItem[] = [];
 		let finalResponse: CodexResponsesResponse | undefined;
 		let reportedModel: string | undefined;
 
 		for await (const event of parseCodexStreamEvents(stream)) {
+			assertCodexStreamEvent(event);
 			reportedModel = getReportedModelFromEvent(event) ?? reportedModel;
 			const eventType = toTrimmed(event.type);
 			if (!eventType) continue;
@@ -951,6 +1071,7 @@ class CodexResponsesChatModel extends BaseChatModel {
 
 			if (eventType === 'response.output_item.done') {
 				const item = toObject(event.item);
+				if (item) doneItems.push(item as CodexResponsesOutputItem);
 				if (!item || toTrimmed(item.type) !== 'function_call') continue;
 				const idx = event.output_index ?? 0;
 				const buffered = toolCallBuffers[idx];
@@ -960,7 +1081,7 @@ class CodexResponsesChatModel extends BaseChatModel {
 				streamedToolCalls.push({
 					id: callId,
 					name,
-					argumentsRaw: buffered?.argumentsRaw || toStringValue(item.arguments) || '{}',
+					argumentsRaw: toStringValue(item.arguments) || buffered?.argumentsRaw || '{}',
 				});
 				continue;
 			}
@@ -971,7 +1092,8 @@ class CodexResponsesChatModel extends BaseChatModel {
 				eventType === 'response.failed' ||
 				eventType === 'response.incomplete'
 			) {
-				finalResponse = toObject(event.response) as CodexResponsesResponse | undefined;
+				finalResponse = terminalCodexResponse(event);
+				break;
 			}
 		}
 		if (finalResponse && reportedModel && !toTrimmed(finalResponse.model)) {
@@ -981,7 +1103,8 @@ class CodexResponsesChatModel extends BaseChatModel {
 		assertSuccessfulCodexResponse(finalResponse);
 		assertNoModelSubstitution(this.modelId, finalResponse);
 
-		const parsedOutput = parseCodexOutputItems(finalResponse?.output);
+		const outputItems = finalResponse?.output?.length ? finalResponse.output : doneItems;
+		const parsedOutput = parseCodexOutputItems(outputItems);
 		const mergedToolCalls = new Map<string, { id: string; name: string; argumentsRaw: string }>();
 		for (const toolCall of streamedToolCalls) {
 			mergedToolCalls.set(toolCall.id, toolCall);
@@ -993,7 +1116,7 @@ class CodexResponsesChatModel extends BaseChatModel {
 		}
 
 		const finalText = text || parsedOutput.text;
-		const content: MessageContent[] = [];
+		const content: MessageContent[] = codexReplayContent(outputItems);
 		if (reasoning) {
 			content.push({
 				type: 'reasoning',
@@ -1039,10 +1162,14 @@ class CodexResponsesChatModel extends BaseChatModel {
 		const request = this.buildRequest(messages, randomUUID());
 		const stream = await this.openResponsesStream(request, config);
 		const toolCallBuffers: Record<number, { id: string; name: string; argumentsRaw: string }> = {};
-		let emittedToolCall = false;
+		const emittedToolCalls = new Set<string>();
+		const replayedItems = new Set<string>();
+		const textIndices = new Set<number>();
+		let emittedText = false;
 		let reportedModel: string | undefined;
 
 		for await (const event of parseCodexStreamEvents(stream)) {
+			assertCodexStreamEvent(event);
 			reportedModel = getReportedModelFromEvent(event) ?? reportedModel;
 			const eventType = toTrimmed(event.type);
 			if (!eventType) continue;
@@ -1050,6 +1177,8 @@ class CodexResponsesChatModel extends BaseChatModel {
 			if (eventType === 'response.output_text.delta') {
 				const delta = toStringValue(event.delta);
 				if (delta) {
+					emittedText = true;
+					textIndices.add(event.output_index ?? 0);
 					yield { type: 'text-delta', delta };
 				}
 				continue;
@@ -1090,19 +1219,34 @@ class CodexResponsesChatModel extends BaseChatModel {
 			}
 
 			if (eventType === 'response.output_item.done') {
-				const item = toObject(event.item);
-				if (!item || toTrimmed(item.type) !== 'function_call') continue;
+				const item = toObject(event.item) as CodexResponsesOutputItem | undefined;
+				if (!item) continue;
+				for (const content of codexReplayContent([item])) {
+					const key = JSON.stringify(content);
+					if (!replayedItems.has(key)) {
+						replayedItems.add(key);
+						yield { type: 'content', content };
+					}
+				}
 				const idx = event.output_index ?? 0;
+				if (item.type === 'message' && !textIndices.has(idx)) {
+					const parsed = parseCodexOutputItems([item]);
+					if (parsed.text) {
+						emittedText = true;
+						yield { type: 'text-delta', delta: parsed.text };
+					}
+				}
+				if (item.type !== 'function_call') continue;
 				const buffered = toolCallBuffers[idx];
 				const callId = toTrimmed(item.call_id) ?? buffered?.id;
 				const name = toTrimmed(item.name) ?? buffered?.name;
-				if (!callId || !name) continue;
-				emittedToolCall = true;
+				if (!callId || !name || emittedToolCalls.has(callId)) continue;
+				emittedToolCalls.add(callId);
 				yield {
 					type: 'tool-call-delta',
 					id: callId,
 					name,
-					argumentsDelta: buffered?.argumentsRaw || toStringValue(item.arguments) || '{}',
+					argumentsDelta: toStringValue(item.arguments) || buffered?.argumentsRaw || '{}',
 				};
 				continue;
 			}
@@ -1113,15 +1257,30 @@ class CodexResponsesChatModel extends BaseChatModel {
 				eventType === 'response.failed' ||
 				eventType === 'response.incomplete'
 			) {
-				let response = toObject(event.response) as CodexResponsesResponse | undefined;
+				let response = terminalCodexResponse(event);
 				if (response && reportedModel && !toTrimmed(response.model)) {
 					response = { ...response, model: reportedModel };
 				}
 				assertSuccessfulCodexResponse(response);
 				assertNoModelSubstitution(this.modelId, response);
+				const parsed = parseCodexOutputItems(response?.output);
+				if (!emittedText && parsed.text) yield { type: 'text-delta', delta: parsed.text };
+				for (const content of codexReplayContent(response?.output ?? [])) {
+					if (!replayedItems.has(JSON.stringify(content))) yield { type: 'content', content };
+				}
+				for (const call of parsed.toolCalls) {
+					if (emittedToolCalls.has(call.id)) continue;
+					emittedToolCalls.add(call.id);
+					yield {
+						type: 'tool-call-delta',
+						id: call.id,
+						name: call.name,
+						argumentsDelta: call.argumentsRaw,
+					};
+				}
 				yield {
 					type: 'finish',
-					finishReason: emittedToolCall ? 'tool-calls' : 'stop',
+					finishReason: emittedToolCalls.size > 0 ? 'tool-calls' : 'stop',
 					usage: parseCodexTokenUsage(response?.usage),
 				};
 				return;
@@ -1566,7 +1725,11 @@ function normalizePersistedModelInfo(value: unknown): PersistedModelInfo | undef
 		serviceTiers: normalizeServiceTiers(obj.serviceTiers ?? obj.service_tiers),
 		...(defaultServiceTier ? { defaultServiceTier } : {}),
 		useResponsesLite: Boolean(obj.useResponsesLite ?? obj.use_responses_lite),
-		baseInstructions: toTrimmed(obj.baseInstructions ?? obj.base_instructions),
+		baseInstructions: toTrimmed(
+			toObject(obj.model_messages)?.instructions_template ??
+				obj.baseInstructions ??
+				obj.base_instructions,
+		),
 	};
 }
 
@@ -1600,138 +1763,9 @@ function normalizeModelsCatalogState(value: unknown): ModelsCatalogState | undef
 	};
 }
 
-function fallbackModel(
-	slug: string,
-	displayName: string,
-	description: string,
-	priority: number,
-	visibility: PersistedModelInfo['visibility'],
-	defaultReasoningEffort: ModelReasoningEffort,
-	defaultReasoningSummary: CodexReasoningSummary,
-	defaultVerbosity: CodexVerbosity,
-	useResponsesLite: boolean,
-	serviceTiers: ModelServiceTier[] = [],
-): PersistedModelInfo {
-	return {
-		slug,
-		displayName,
-		description,
-		priority,
-		supportedInApi: true,
-		visibility,
-		supportsParallelToolCalls: true,
-		supportedReasoningEfforts: (MODEL_REASONING_EFFORTS[slug] ?? []).map((effort) => ({ effort })),
-		defaultReasoningEffort,
-		supportsReasoningSummary: true,
-		defaultReasoningSummary,
-		supportsVerbosity: true,
-		defaultVerbosity,
-		serviceTiers,
-		useResponsesLite,
-	};
-}
-
-const PRIORITY_SERVICE_TIER: ModelServiceTier[] = [
-	{ id: 'priority', name: 'Fast', description: '1.5x speed, increased usage' },
-];
-
 const FALLBACK_MODELS_CATALOG: ModelsCatalogState = {
 	fetchedAt: new Date(0).toISOString(),
-	models: [
-		fallbackModel(
-			'gpt-5.6-sol',
-			'GPT-5.6-Sol',
-			'Latest frontier agentic coding model.',
-			1,
-			'list',
-			'low',
-			'none',
-			'low',
-			true,
-			PRIORITY_SERVICE_TIER,
-		),
-		fallbackModel(
-			'gpt-5.6-terra',
-			'GPT-5.6-Terra',
-			'Balanced agentic coding model for everyday work.',
-			2,
-			'list',
-			'medium',
-			'none',
-			'low',
-			true,
-			PRIORITY_SERVICE_TIER,
-		),
-		fallbackModel(
-			'gpt-5.6-luna',
-			'GPT-5.6-Luna',
-			'Fast and affordable agentic coding model.',
-			3,
-			'list',
-			'medium',
-			'none',
-			'low',
-			true,
-			PRIORITY_SERVICE_TIER,
-		),
-		fallbackModel(
-			'gpt-5.5',
-			'GPT-5.5',
-			'Frontier model for complex coding, research, and real-world work.',
-			7,
-			'list',
-			'medium',
-			'none',
-			'low',
-			false,
-			PRIORITY_SERVICE_TIER,
-		),
-		fallbackModel(
-			'gpt-5.4',
-			'GPT-5.4',
-			'Strong model for everyday coding.',
-			16,
-			'hide',
-			'medium',
-			'none',
-			'low',
-			false,
-			PRIORITY_SERVICE_TIER,
-		),
-		fallbackModel(
-			'gpt-5.4-mini',
-			'GPT-5.4-Mini',
-			'Small, fast, and cost-efficient model for simpler coding tasks.',
-			23,
-			'hide',
-			'medium',
-			'none',
-			'medium',
-			false,
-		),
-		fallbackModel(
-			'gpt-5.2',
-			'GPT-5.2',
-			'Optimized for professional work and long-running agents.',
-			29,
-			'list',
-			'medium',
-			'auto',
-			'low',
-			false,
-		),
-		fallbackModel(
-			'codex-auto-review',
-			'Codex Auto Review',
-			'Automatic approval review model for Codex.',
-			43,
-			'hide',
-			'medium',
-			'none',
-			'low',
-			false,
-		),
-	],
+	models: fallbackModels.models.map((model) => normalizePersistedModelInfo(model)!).filter(Boolean),
 };
 
 function mergeWithFallbackCatalog(catalog: ModelsCatalogState | undefined): ModelsCatalogState {
@@ -1755,7 +1789,10 @@ function getModelRecordFromCatalog(
 ): PersistedModelInfo | undefined {
 	const normalized = normalizeModelName(modelName);
 	if (!normalized) return undefined;
-	return catalog?.models.find((model) => model.slug === normalized);
+	return (
+		catalog?.models.find((model) => model.slug === normalized) ??
+		FALLBACK_MODELS_CATALOG.models.find((model) => model.slug === normalized)
+	);
 }
 
 function getModelOptionsFromCatalog(catalog: ModelsCatalogState): INodePropertyOptions[] {
@@ -1767,7 +1804,7 @@ function getModelOptionsFromCatalog(catalog: ModelsCatalogState): INodePropertyO
 	];
 
 	for (const model of catalog.models) {
-		if (!model.supportedInApi || model.visibility !== 'list') continue;
+		if (model.visibility !== 'list') continue;
 		options.push({
 			name: model.displayName,
 			value: model.slug,
@@ -2675,6 +2712,11 @@ async function resolveModelsCatalogForLoadOptions(
 	if (shouldRefreshAuthTokens(auth)) {
 		try {
 			auth = await refreshChatgptTokens(authContext, auth);
+			// Refresh tokens may rotate even when the subsequent model-catalog request fails.
+			await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
+				...loadedState,
+				codexAuthJson: deepCloneAuthJson(auth),
+			});
 		} catch {
 			return mergeWithFallbackCatalog(loadedState.modelsCatalog);
 		}
@@ -2826,7 +2868,8 @@ function resolveConfiguredModelName(
 	context: ISupplyDataFunctions,
 	itemIndex: number,
 ): { modelName: string } {
-	const selectedModel = context.getNodeParameter('model', itemIndex, DEFAULT_MODEL) as string;
+	const defaultModel = context.getNode().typeVersion < 2 ? LEGACY_DEFAULT_MODEL : DEFAULT_MODEL;
+	const selectedModel = context.getNodeParameter('model', itemIndex, defaultModel) as string;
 	const customModel = context.getNodeParameter('customModel', itemIndex, '') as string;
 	const modelName = resolveEffectiveModelName(selectedModel, customModel);
 
@@ -2940,8 +2983,15 @@ function resolveServiceTier(
 ): string | undefined {
 	const selected = toTrimmed(context.getNodeParameter('serviceTier', itemIndex, 'default'));
 	const modelInfo = getModelRecordFromCatalog(modelsCatalog, modelName);
-	if (!selected || selected === 'default') return modelInfo?.defaultServiceTier;
-	if (modelInfo && !modelInfo.serviceTiers.some((tier) => tier.id === selected)) {
+	if (!selected || selected === 'default') {
+		const tier = modelInfo?.defaultServiceTier;
+		return tier && tier !== 'default' ? tier : undefined;
+	}
+	if (
+		selected !== 'flex' &&
+		modelInfo &&
+		!modelInfo.serviceTiers.some((tier) => tier.id === selected)
+	) {
 		throw new NodeOperationError(
 			context.getNode(),
 			`Service Tier "${selected}" is not supported by model "${modelName}".`,
@@ -2960,7 +3010,7 @@ export class OpenAiCodexChatModel implements INodeType {
 			dark: 'file:../../icons/openAiCodex.dark.svg',
 		},
 		group: ['transform'],
-		version: [1],
+		version: [1, 2],
 		subtitle: '={{ $parameter.model }}',
 		description: 'Codex chat model using ChatGPT Codex backend with built-in device-code auth',
 		defaults: {
@@ -3001,7 +3051,21 @@ export class OpenAiCodexChatModel implements INodeType {
 				displayName: 'Model Name or ID',
 				name: 'model',
 				type: 'options',
+				default: LEGACY_DEFAULT_MODEL,
+				displayOptions: { show: { '@version': [1] } },
+				options: MODEL_OPTIONS,
+				typeOptions: {
+					loadOptionsMethod: 'getCodexModelOptions',
+				},
+				description:
+					'Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>',
+			},
+			{
+				displayName: 'Model Name or ID',
+				name: 'model',
+				type: 'options',
 				default: DEFAULT_MODEL,
+				displayOptions: { show: { '@version': [2] } },
 				options: MODEL_OPTIONS,
 				typeOptions: {
 					loadOptionsMethod: 'getCodexModelOptions',
@@ -3014,7 +3078,7 @@ export class OpenAiCodexChatModel implements INodeType {
 				name: 'customModel',
 				type: 'string',
 				default: '',
-				placeholder: 'e.g. gpt-5.4',
+				placeholder: 'e.g. gpt-6.1-sol',
 				displayOptions: {
 					show: {
 						model: [CUSTOM_MODEL_VALUE],
@@ -3114,11 +3178,14 @@ export class OpenAiCodexChatModel implements INodeType {
 				const modelInfo = getModelRecordFromCatalog(catalog, modelName);
 				return [
 					{ name: 'Model Default', value: 'default' },
-					...(modelInfo?.serviceTiers ?? []).map((tier) => ({
-						name: tier.name,
-						value: tier.id,
-						...(tier.description ? { description: tier.description } : {}),
-					})),
+					{ name: 'Flex', value: 'flex' },
+					...(modelInfo?.serviceTiers ?? [])
+						.filter((tier) => tier.id !== 'flex')
+						.map((tier) => ({
+							name: tier.name,
+							value: tier.id,
+							...(tier.description ? { description: tier.description } : {}),
+						})),
 				];
 			},
 		},

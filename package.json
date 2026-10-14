@@ -1,6 +1,6 @@
 {
 	"name": "n8n-nodes-openai-codex",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"description": "n8n AI chat model node for the current ChatGPT Codex Responses backend",
 	"license": "MIT",
 	"keywords": [
@@ -21,7 +21,10 @@
 		"lint": "n8n-node lint",
 		"lint:fix": "n8n-node lint --fix",
 		"release": "n8n-node release",
-		"prepublishOnly": "n8n-node prerelease"
+		"prepublishOnly": "n8n-node prerelease",
+		"test": "pnpm build && node --test tests/*.test.cjs",
+		"typecheck": "tsc --noEmit",
+		"sync:models": "node scripts/sync-codex-models.mjs"
 	},
 	"files": [
 		"dist"
@@ -35,17 +38,18 @@
 		]
 	},
 	"devDependencies": {
-		"@n8n/ai-node-sdk": ">=0.20.3 <1",
-		"@n8n/node-cli": ">=0.39.3 <1",
-		"eslint": "9.32.0",
-		"n8n-workflow": ">=2.30.2 <3",
+		"@n8n/ai-node-sdk": ">=0.34.0 <1",
+		"@n8n/node-cli": ">=0.53.0 <1",
+		"eslint": "9.29.0",
+		"n8n-workflow": ">=2.44.0 <3",
 		"prettier": "3.6.2",
 		"release-it": "^19.0.4",
 		"typescript": "5.9.2",
-		"zod": "3.25.67"
+		"zod": "3.25.76"
 	},
 	"peerDependencies": {
-		"@n8n/ai-node-sdk": "*",
+		"@n8n/ai-node-sdk": ">=0.34.0 <1",
 		"n8n-workflow": "*"
-	}
+	},
+	"homepage": "https://github.com/vrs11/n8n-codex"
 }

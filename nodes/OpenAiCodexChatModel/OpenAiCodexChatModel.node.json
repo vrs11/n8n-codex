@@ -1,8 +1,10 @@
 {
 	"node": "n8n-nodes-openai-codex.openAiCodexChatModel",
-	"nodeVersion": "1.0",
+	"nodeVersion": "2.0",
 	"codexVersion": "1.0",
-	"categories": ["AI", "Development"],
+	"categories": [
+		"Development"
+	],
 	"resources": {
 		"primaryDocumentation": [
 			{
