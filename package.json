@@ -15,7 +15,7 @@
 		"email": "valentine.vrs11@gmail.com"
 	},
 	"scripts": {
-		"build": "n8n-node build",
+		"build": "n8n-node build && node scripts/bundle-tool-schema.mjs",
 		"build:watch": "tsc --watch",
 		"dev": "n8n-node dev",
 		"lint": "n8n-node lint",
@@ -38,18 +38,23 @@
 		]
 	},
 	"devDependencies": {
-		"@n8n/ai-node-sdk": ">=0.34.0 <1",
+		"@n8n/ai-node-sdk": ">=0.34.0 <0.35.0",
 		"@n8n/node-cli": ">=0.53.0 <1",
 		"eslint": "9.29.0",
 		"n8n-workflow": ">=2.44.0 <3",
 		"prettier": "3.6.2",
 		"release-it": "^19.0.4",
 		"typescript": "5.9.2",
-		"zod": "3.25.76"
+		"zod": "3.25.76",
+		"zod-to-json-schema": "3.25.2",
+		"esbuild": "0.28.2"
 	},
 	"peerDependencies": {
-		"@n8n/ai-node-sdk": ">=0.34.0 <1",
+		"@n8n/ai-node-sdk": ">=0.34.0 <0.35.0",
 		"n8n-workflow": "*"
+	},
+	"engines": {
+		"node": ">=24"
 	},
 	"homepage": "https://github.com/vrs11/n8n-codex"
 }

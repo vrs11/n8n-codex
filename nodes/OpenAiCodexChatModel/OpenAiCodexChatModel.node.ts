@@ -1,8 +1,6 @@
 import {
 	BaseChatModel,
-	getParametersJsonSchema,
 	parseSSEStream,
-	supplyModel,
 	type ChatModelConfig,
 	type GenerateResult,
 	type Message,
@@ -15,6 +13,9 @@ import { randomUUID } from 'node:crypto';
 import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { getCodexToolParameters } from './tool-schema';
+import { supplyCodexModel } from './n8n-adapter';
 import packageJson from '../../package.json';
 import fallbackModels from './fallback-models.json';
 import type {
@@ -185,7 +186,7 @@ const ALL_REASONING_EFFORTS: ReadonlyArray<ModelReasoningEffort> = [
 function reasoningEffortLabel(value: CodexReasoningEffort): string {
 	const labels: Readonly<Record<string, string>> = {
 		default: 'Model Default',
-		none: 'None',
+		none: 'No Effort Override',
 		minimal: 'Minimal',
 		low: 'Low',
 		medium: 'Medium',
@@ -266,7 +267,7 @@ type CodexResponsesInputItem =
 	| {
 			type: 'function_call_output';
 			call_id: string;
-			output: string;
+			output: string | CodexResponsesMessageContentItem[];
 	  }
 	| {
 			type: 'additional_tools';
@@ -286,7 +287,7 @@ type CodexResponsesTool = {
 	type: 'function';
 	name: string;
 	description: string;
-	strict: false;
+	strict: boolean;
 	parameters: Record<string, unknown>;
 };
 
@@ -300,7 +301,7 @@ type CodexResponsesRequest = {
 	model: string;
 	input: CodexResponsesInputItem[];
 	tools?: CodexResponsesTool[];
-	tool_choice: 'auto';
+	tool_choice: 'auto' | 'none' | 'required';
 	parallel_tool_calls: boolean;
 	stream: true;
 	store: false;
@@ -308,14 +309,14 @@ type CodexResponsesRequest = {
 	prompt_cache_key: string;
 	reasoning?: CodexResponsesReasoning;
 	service_tier?: string;
-	text?: { verbosity: CodexVerbosity };
+	text?: { verbosity?: CodexVerbosity; format?: Record<string, unknown> };
 	client_metadata: Record<string, string>;
 };
 
 type CodexResponsesOutputItem = {
 	type?: string;
 	role?: string;
-	content?: Array<{ type?: string; text?: string }>;
+	content?: Array<{ type?: string; text?: string; refusal?: string }>;
 	call_id?: string;
 	name?: string;
 	arguments?: string;
@@ -374,7 +375,7 @@ type CodexResponsesChatModelConfig = {
 	verbosity?: CodexVerbosity;
 	parallelToolCalls: boolean;
 	useResponsesLite: boolean;
-	refreshAuthHeaders: () => Promise<Record<string, string>>;
+	refreshAuthHeaders: (rejectedAuthorization: string) => Promise<Record<string, string>>;
 	chatgptAccountId: string;
 	openStreamRequest: CodexOpenStreamRequest;
 	debugState: BoundToolsDebugState;
@@ -448,16 +449,19 @@ function getReportedModelFromEvent(event: CodexStreamEvent): string | undefined 
 	);
 }
 
-function parseToolCallArguments(raw: string): Record<string, unknown> {
+function parseToolCallArguments(raw: string, toolName: string): Record<string, unknown> {
+	let parsed: unknown;
 	try {
-		const parsed = JSON.parse(raw) as unknown;
-		if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-			return parsed as Record<string, unknown>;
-		}
+		parsed = JSON.parse(raw);
 	} catch {
-		// ignore and return empty object
+		parsed = undefined;
 	}
-	return {};
+	if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+		throw new OperationalError(
+			`Tool "${toolName}" returned malformed arguments; expected a JSON object`,
+		);
+	}
+	return parsed as Record<string, unknown>;
 }
 
 function parseCodexOutputItems(outputItems: unknown): {
@@ -478,8 +482,8 @@ function parseCodexOutputItems(outputItems: unknown): {
 			for (const block of contentItems) {
 				const blockObj = toObject(block);
 				if (!blockObj) continue;
-				if (toTrimmed(blockObj.type) === 'output_text') {
-					const text = toStringValue(blockObj.text);
+				if (blockObj.type === 'output_text' || blockObj.type === 'refusal') {
+					const text = toStringValue(blockObj.text ?? blockObj.refusal);
 					if (text) textParts.push(text);
 				}
 			}
@@ -487,12 +491,12 @@ function parseCodexOutputItems(outputItems: unknown): {
 		}
 
 		if (type === 'function_call') {
-			const id = toTrimmed(itemObj.call_id) ?? toTrimmed(itemObj.id);
+			const id = toTrimmed(itemObj.call_id);
 			const name = toTrimmed(itemObj.name);
-			const argumentsRaw = toTrimmed(itemObj.arguments) ?? '{}';
-			if (id && name) {
-				toolCalls.push({ id, name, argumentsRaw });
-			}
+			const argumentsRaw = toStringValue(itemObj.arguments) ?? '';
+			if (!id || !name)
+				throw new OperationalError('Codex returned a tool call without its ID or name');
+			toolCalls.push({ id, name, argumentsRaw });
 		}
 	}
 
@@ -522,7 +526,11 @@ function toCodexInputMedia(part: MessageContent): CodexResponsesMessageContentIt
 	if (part.type !== 'file') return undefined;
 
 	const mediaType = toTrimmed(part.mediaType)?.toLowerCase();
-	if (!mediaType?.startsWith('image/') && !mediaType?.startsWith('audio/')) return undefined;
+	if (!mediaType?.startsWith('image/') && !mediaType?.startsWith('audio/')) {
+		throw new OperationalError(
+			`Unsupported media input "${mediaType ?? 'unknown'}"; extract document text before sending it to Codex`,
+		);
+	}
 
 	const remoteUrl = toTrimmed(part.providerMetadata?.url);
 	const rawData =
@@ -533,7 +541,7 @@ function toCodexInputMedia(part: MessageContent): CodexResponsesMessageContentIt
 				: undefined;
 	const mediaUrl =
 		remoteUrl ??
-		(rawData?.startsWith('data:')
+		(rawData && /^(data:|https?:\/\/)/.test(rawData)
 			? rawData
 			: rawData
 				? `data:${mediaType};base64,${rawData}`
@@ -549,14 +557,23 @@ function toCodexInputMedia(part: MessageContent): CodexResponsesMessageContentIt
 }
 
 function stringifyToolCallInput(input: string): string {
-	const trimmed = toTrimmed(input);
-	if (!trimmed) return '{}';
-	try {
-		JSON.parse(trimmed);
-		return trimmed;
-	} catch {
-		return JSON.stringify(trimmed);
+	parseToolCallArguments(input, 'conversation history');
+	return input;
+}
+
+function codexToolOutput(result: unknown): string | CodexResponsesMessageContentItem[] {
+	if (
+		!Array.isArray(result) ||
+		!result.every((part) =>
+			['text', 'reasoning', 'file', 'provider'].includes(String(toObject(part)?.type)),
+		)
+	) {
+		return typeof result === 'string' ? result : JSON.stringify(result ?? null);
 	}
+	return (result as MessageContent[]).map((part) => {
+		const media = toCodexInputMedia(part);
+		return media ?? { type: 'input_text', text: toCodexOutputText(part) ?? '' };
+	});
 }
 
 function toCodexInput(
@@ -637,10 +654,11 @@ function toCodexInput(
 				if (part.type === 'reasoning' || (part.type === 'text' && hasReplayMessages)) continue;
 				if (part.type === 'tool-call') {
 					const name = toTrimmed(part.toolName);
-					if (!name) continue;
+					if (!name || !toTrimmed(part.toolCallId))
+						throw new OperationalError('Tool-call history is missing its name or ID');
 					input.push({
 						type: 'function_call',
-						call_id: toTrimmed(part.toolCallId) ?? randomUUID(),
+						call_id: toTrimmed(part.toolCallId)!,
 						name,
 						arguments: stringifyToolCallInput(part.input),
 					});
@@ -667,9 +685,8 @@ function toCodexInput(
 			for (const part of message.content) {
 				if (part.type !== 'tool-result') continue;
 				const callId = toTrimmed(part.toolCallId);
-				if (!callId) continue;
-				const output =
-					typeof part.result === 'string' ? part.result : JSON.stringify(part.result ?? null);
+				if (!callId) throw new OperationalError('Tool-result history is missing its call ID');
+				const output = codexToolOutput(part.result);
 				input.push({
 					type: 'function_call_output',
 					call_id: callId,
@@ -700,60 +717,24 @@ function toCodexInput(
 
 function codexToolFromGenericTool(tool: Tool): CodexResponsesTool | undefined {
 	if (tool.type === 'provider') {
-		return undefined;
+		throw new OperationalError(
+			`Provider tool "${tool.name}" is not supported by the Codex chat backend`,
+		);
 	}
 
 	const rawName = toTrimmed(tool.name);
-	if (!rawName) return undefined;
+	if (!rawName) throw new OperationalError('Tool name cannot be empty');
 
 	const name = rawName;
 	const description = toTrimmed(tool.description) ?? 'No description';
-	const parameters = normalizeCodexToolParameters(getParametersJsonSchema(tool));
+	const parameters = getCodexToolParameters(tool.inputSchema, name);
 
 	return {
 		type: 'function',
 		name,
 		description,
-		strict: false,
+		strict: tool.strict ?? false,
 		parameters,
-	};
-}
-
-function normalizeCodexToolParameters(rawSchema: unknown): Record<string, unknown> {
-	const sanitized = sanitizeToolJsonSchema(rawSchema);
-	const schemaObj = toObject(sanitized);
-	if (!schemaObj) {
-		return {
-			type: 'object',
-			properties: {},
-			additionalProperties: false,
-		};
-	}
-
-	const schemaType = toTrimmed(schemaObj.type)?.toLowerCase();
-	if (schemaType === 'object' || toObject(schemaObj.properties)) {
-		const properties = toObject(schemaObj.properties) ?? {};
-		const normalized: Record<string, unknown> = {
-			...schemaObj,
-			type: 'object',
-			properties,
-			additionalProperties:
-				typeof schemaObj.additionalProperties === 'boolean'
-					? schemaObj.additionalProperties
-					: false,
-		};
-		return normalized;
-	}
-
-	// n8n tools like Calculator can expose a primitive top-level schema.
-	// Codex responses backend expects function parameters to be an object.
-	return {
-		type: 'object',
-		properties: {
-			input: schemaObj,
-		},
-		required: ['input'],
-		additionalProperties: false,
 	};
 }
 
@@ -778,7 +759,9 @@ function codexReplayContent(items: CodexResponsesOutputItem[]): MessageContent[]
 					codexMessageItem: {
 						type: 'message',
 						role: 'assistant',
-						content: item.content,
+						content: item.content.map((part) =>
+							part.type === 'refusal' ? { type: 'output_text', text: part.refusal ?? '' } : part,
+						),
 						...(item.phase ? { phase: item.phase } : {}),
 					},
 				},
@@ -835,6 +818,9 @@ function assertSuccessfulCodexResponse(response: CodexResponsesResponse | undefi
 	}
 
 	const status = toTrimmed(response.status);
+	if (status && !['completed', 'failed', 'incomplete'].includes(status)) {
+		throw new OperationalError(`Codex response did not complete: ${status}`);
+	}
 	if (status === 'failed') {
 		const detail = toTrimmed(response.error?.message) ?? toTrimmed(response.error?.code);
 		throw new OperationalError(
@@ -854,12 +840,58 @@ class CodexResponsesChatModel extends BaseChatModel {
 	private readonly threadId = randomUUID();
 	private readonly installationId = randomUUID();
 	private readonly windowId = randomUUID();
+	private invocationOptions: Record<string, unknown> = {};
 
 	constructor(
 		modelId: string,
-		private readonly config: CodexResponsesChatModelConfig,
+		private config: CodexResponsesChatModelConfig,
 	) {
 		super('openai-codex', modelId);
+	}
+
+	withTools(tools: Tool[]): CodexResponsesChatModel {
+		const names = new Set<string>();
+		for (const tool of tools) {
+			if (names.has(tool.name)) throw new OperationalError(`Duplicate tool name "${tool.name}"`);
+			names.add(tool.name);
+		}
+		const model = super.withTools([]) as CodexResponsesChatModel;
+		model.tools = [...tools];
+		model.config = { ...this.config, debugState: { toolNames: [] } };
+		return model;
+	}
+
+	withInvocationConfig(options: Record<string, unknown>): CodexResponsesChatModel {
+		const model = this.withTools(this.tools);
+		model.invocationOptions = { ...this.invocationOptions, ...options };
+		return model;
+	}
+
+	private resolveInvocationConfig(
+		config?: ChatModelConfig,
+	): ChatModelConfig & Record<string, unknown> {
+		const merged: ChatModelConfig & Record<string, unknown> = {
+			...this.defaultConfig,
+			...this.invocationOptions,
+			...config,
+		};
+		if (merged.abortSignal?.aborted)
+			throw merged.abortSignal.reason ?? new OperationalError('Codex request was cancelled');
+		for (const key of [
+			'temperature',
+			'topP',
+			'topK',
+			'presencePenalty',
+			'frequencyPenalty',
+			'seed',
+			'maxTokens',
+			'stopSequences',
+			'stop',
+		]) {
+			if (merged[key] !== undefined)
+				throw new OperationalError(`Codex does not support the generation option "${key}"`);
+		}
+		return merged;
 	}
 
 	private buildRequestHeaders(config?: ChatModelConfig): Record<string, string> {
@@ -877,7 +909,11 @@ class CodexResponsesChatModel extends BaseChatModel {
 		return headers;
 	}
 
-	private buildRequest(messages: Message[], turnId: string): CodexResponsesRequest {
+	private buildRequest(
+		messages: Message[],
+		turnId: string,
+		options: Record<string, unknown>,
+	): CodexResponsesRequest {
 		const tools: CodexResponsesTool[] = [];
 		for (const tool of this.tools) {
 			const normalizedTool = codexToolFromGenericTool(tool);
@@ -885,6 +921,39 @@ class CodexResponsesChatModel extends BaseChatModel {
 			tools.push(normalizedTool);
 		}
 
+		const choice = options.tool_choice ?? 'auto';
+		const forcedName =
+			typeof choice === 'string' && !['auto', 'none', 'required', 'any'].includes(choice)
+				? choice
+				: (toTrimmed(toObject(choice)?.name) ??
+					toTrimmed(toObject(toObject(choice)?.function)?.name));
+		if (forcedName) {
+			const selected = tools.find((tool) => tool.name === forcedName);
+			if (!selected)
+				throw new OperationalError(`Requested tool "${forcedName}" is not bound to this model`);
+			tools.splice(0, tools.length, selected);
+		} else if (!['auto', 'none', 'required', 'any'].includes(String(choice))) {
+			throw new OperationalError('Unsupported tool_choice value');
+		}
+		const toolChoice =
+			forcedName || choice === 'any'
+				? 'required'
+				: (choice as CodexResponsesRequest['tool_choice']);
+		if (toolChoice === 'required' && tools.length === 0)
+			throw new OperationalError('Forced tool choice requires at least one bound tool');
+		let format = toObject(options.response_format);
+		if (format && !['json_schema', 'json_object'].includes(String(format.type)))
+			throw new OperationalError('Unsupported response_format');
+		if (format?.type === 'json_schema') {
+			const definition = toObject(format.json_schema) ?? format;
+			const name = toTrimmed(definition.name) ?? 'extract';
+			format = {
+				type: 'json_schema',
+				name,
+				strict: definition.strict ?? false,
+				schema: getCodexToolParameters(definition.schema, name),
+			};
+		}
 		const normalizedInput = toCodexInput(messages);
 		const instructions = normalizedInput.instructions ?? this.config.defaultInstructions;
 		const input = [...normalizedInput.input];
@@ -892,8 +961,13 @@ class CodexResponsesChatModel extends BaseChatModel {
 		if (this.config.useResponsesLite) {
 			for (const item of input) {
 				if (item.type === 'function_call') item.namespace = 'functions';
-				if (item.type !== 'message') continue;
-				for (const contentItem of item.content) {
+				const content =
+					item.type === 'message'
+						? item.content
+						: item.type === 'function_call_output' && Array.isArray(item.output)
+							? item.output
+							: [];
+				for (const contentItem of content) {
 					if (contentItem.type === 'input_image') delete contentItem.detail;
 				}
 			}
@@ -922,13 +996,23 @@ class CodexResponsesChatModel extends BaseChatModel {
 			...(this.config.serviceTier ? { service_tier: this.config.serviceTier } : {}),
 			input,
 			...(this.config.useResponsesLite ? {} : { tools }),
-			tool_choice: 'auto',
-			parallel_tool_calls: this.config.parallelToolCalls && !this.config.useResponsesLite,
+			tool_choice: toolChoice,
+			parallel_tool_calls:
+				this.config.parallelToolCalls &&
+				options.parallel_tool_calls !== false &&
+				!this.config.useResponsesLite,
 			store: false,
 			include: ['reasoning.encrypted_content'],
 			prompt_cache_key: this.sessionId,
 			...(reasoning ? { reasoning } : {}),
-			...(this.config.verbosity ? { text: { verbosity: this.config.verbosity } } : {}),
+			...(this.config.verbosity || format
+				? {
+						text: {
+							...(this.config.verbosity ? { verbosity: this.config.verbosity } : {}),
+							...(format ? { format } : {}),
+						},
+					}
+				: {}),
 			client_metadata: {
 				'x-codex-installation-id': this.installationId,
 				session_id: this.sessionId,
@@ -943,7 +1027,9 @@ class CodexResponsesChatModel extends BaseChatModel {
 		this.config.debugState.lastToolChoice = request.tool_choice;
 		this.config.debugState.lastParallelToolCalls = String(request.parallel_tool_calls);
 		this.config.debugState.lastToolsPayload =
-			tools.length > 0 ? truncateErrorValue(JSON.stringify(tools)) : undefined;
+			process.env.N8N_OPENAI_CODEX_DEBUG_PAYLOADS === 'true' && tools.length > 0
+				? truncateErrorValue(JSON.stringify(tools))
+				: undefined;
 		this.config.debugState.lastReasoning = reasoning
 			? truncateErrorValue(JSON.stringify(reasoning))
 			: undefined;
@@ -957,23 +1043,41 @@ class CodexResponsesChatModel extends BaseChatModel {
 		request: CodexResponsesRequest,
 		config?: ChatModelConfig,
 	): Promise<AsyncIterableIterator<Buffer | Uint8Array>> {
-		let response = await this.config.openStreamRequest(
-			request,
-			this.buildRequestHeaders(config),
-			config,
-		);
-
-		if (response.statusCode === 401) {
+		const retries = config?.maxRetries ?? 2;
+		if (!Number.isInteger(retries) || retries < 0 || retries > 5)
+			throw new OperationalError('maxRetries must be an integer between 0 and 5');
+		let response: IN8nHttpFullResponse;
+		let refreshed = false;
+		let attempts = 0;
+		while (true) {
+			if (config?.abortSignal?.aborted)
+				throw config.abortSignal.reason ?? new OperationalError('Codex request was cancelled');
+			const headers = this.buildRequestHeaders(config);
+			response = await this.config.openStreamRequest(request, headers, config);
+			if (response.statusCode === 401 && !refreshed) {
+				await readCodexErrorBody(response.body);
+				Object.assign(
+					this.config.baseHeaders,
+					await this.config.refreshAuthHeaders(headers.Authorization),
+				);
+				refreshed = true;
+				continue;
+			}
+			if (![408, 429, 500, 502, 503, 504].includes(response.statusCode) || attempts >= retries)
+				break;
 			await readCodexErrorBody(response.body);
-			const refreshedHeaders = await this.config.refreshAuthHeaders();
-			Object.assign(this.config.baseHeaders, refreshedHeaders);
-			response = await this.config.openStreamRequest(
-				request,
-				{
-					...this.buildRequestHeaders(config),
-					...refreshedHeaders,
-				},
-				config,
+			const retryAfter = toStringValue(toObject(response.headers)?.['retry-after']);
+			const seconds = retryAfter ? Number(retryAfter) : NaN;
+			const waitMs = Number.isFinite(seconds)
+				? seconds * 1000
+				: retryAfter
+					? Date.parse(retryAfter) - Date.now()
+					: 250 * 2 ** attempts;
+			attempts++;
+			await delay(
+				Math.min(30_000, Math.max(0, Number.isFinite(waitMs) ? waitMs : 250)),
+				undefined,
+				{ signal: config?.abortSignal },
 			);
 		}
 
@@ -1010,283 +1114,158 @@ class CodexResponsesChatModel extends BaseChatModel {
 	}
 
 	async generate(messages: Message[], config?: ChatModelConfig): Promise<GenerateResult> {
-		const request = this.buildRequest(messages, randomUUID());
-		const stream = await this.openResponsesStream(request, config);
-
+		const iterator = this.streamResponse(messages, config);
+		const content: MessageContent[] = [];
 		let text = '';
-		let reasoning = '';
-		const streamedToolCalls: Array<{
-			id: string;
-			name: string;
-			argumentsRaw: string;
-		}> = [];
-		const toolCallBuffers: Record<number, { id: string; name: string; argumentsRaw: string }> = {};
-		const doneItems: CodexResponsesOutputItem[] = [];
 		let finalResponse: CodexResponsesResponse | undefined;
-		let reportedModel: string | undefined;
-
-		for await (const event of parseCodexStreamEvents(stream)) {
-			assertCodexStreamEvent(event);
-			reportedModel = getReportedModelFromEvent(event) ?? reportedModel;
-			const eventType = toTrimmed(event.type);
-			if (!eventType) continue;
-
-			if (eventType === 'response.output_text.delta') {
-				const delta = toStringValue(event.delta);
-				if (delta) text += delta;
-				continue;
-			}
-
-			if (
-				eventType === 'response.reasoning_summary_text.delta' ||
-				eventType === 'response.reasoning_text.delta'
-			) {
-				const delta = toStringValue(event.delta);
-				if (delta) reasoning += delta;
-				continue;
-			}
-
-			if (eventType === 'response.output_item.added') {
-				const item = toObject(event.item);
-				if (!item) continue;
-				if (toTrimmed(item.type) === 'function_call') {
-					const idx = event.output_index ?? 0;
-					toolCallBuffers[idx] = {
-						id: toTrimmed(item.call_id) ?? toTrimmed(item.id) ?? randomUUID(),
-						name: toTrimmed(item.name) ?? 'tool',
-						argumentsRaw: toStringValue(item.arguments) ?? '',
-					};
-				}
-				continue;
-			}
-
-			if (eventType === 'response.function_call_arguments.delta') {
-				const idx = event.output_index ?? 0;
-				const delta = toStringValue(event.delta);
-				if (delta && toolCallBuffers[idx]) {
-					toolCallBuffers[idx].argumentsRaw += delta;
-				}
-				continue;
-			}
-
-			if (eventType === 'response.output_item.done') {
-				const item = toObject(event.item);
-				if (item) doneItems.push(item as CodexResponsesOutputItem);
-				if (!item || toTrimmed(item.type) !== 'function_call') continue;
-				const idx = event.output_index ?? 0;
-				const buffered = toolCallBuffers[idx];
-				const callId = toTrimmed(item.call_id) ?? buffered?.id;
-				const name = toTrimmed(item.name) ?? buffered?.name;
-				if (!callId || !name) continue;
-				streamedToolCalls.push({
-					id: callId,
-					name,
-					argumentsRaw: toStringValue(item.arguments) || buffered?.argumentsRaw || '{}',
-				});
-				continue;
-			}
-
-			if (
-				eventType === 'response.done' ||
-				eventType === 'response.completed' ||
-				eventType === 'response.failed' ||
-				eventType === 'response.incomplete'
-			) {
-				finalResponse = terminalCodexResponse(event);
+		let finish: Extract<StreamChunk, { type: 'finish' }> | undefined;
+		while (true) {
+			const step = await iterator.next();
+			if (step.done) {
+				finalResponse = step.value;
 				break;
 			}
+			const chunk = step.value;
+			if (chunk.type === 'text-delta') text += chunk.delta;
+			else if (chunk.type === 'content') content.push(chunk.content);
+			else if (chunk.type === 'tool-call-delta')
+				content.push({
+					type: 'tool-call',
+					toolCallId: chunk.id,
+					toolName: chunk.name!,
+					input: chunk.argumentsDelta!,
+				});
+			else if (chunk.type === 'finish') finish = chunk;
 		}
-		if (finalResponse && reportedModel && !toTrimmed(finalResponse.model)) {
-			finalResponse = { ...finalResponse, model: reportedModel };
-		}
-
-		assertSuccessfulCodexResponse(finalResponse);
-		assertNoModelSubstitution(this.modelId, finalResponse);
-
-		const outputItems = finalResponse?.output?.length ? finalResponse.output : doneItems;
-		const parsedOutput = parseCodexOutputItems(outputItems);
-		const mergedToolCalls = new Map<string, { id: string; name: string; argumentsRaw: string }>();
-		for (const toolCall of streamedToolCalls) {
-			mergedToolCalls.set(toolCall.id, toolCall);
-		}
-		for (const toolCall of parsedOutput.toolCalls) {
-			if (!mergedToolCalls.has(toolCall.id)) {
-				mergedToolCalls.set(toolCall.id, toolCall);
-			}
-		}
-
-		const finalText = text || parsedOutput.text;
-		const content: MessageContent[] = codexReplayContent(outputItems);
-		if (reasoning) {
-			content.push({
-				type: 'reasoning',
-				text: reasoning,
-			});
-		}
-		for (const toolCall of mergedToolCalls.values()) {
-			const parsedArguments = parseToolCallArguments(toolCall.argumentsRaw || '{}');
-			content.push({
-				type: 'tool-call',
-				toolCallId: toolCall.id,
-				toolName: toolCall.name,
-				input: JSON.stringify(parsedArguments),
-			});
-		}
-		if (finalText) {
-			content.push({
-				type: 'text',
-				text: finalText,
-			});
-		}
-
+		if (text) content.push({ type: 'text', text });
 		return {
-			id: toTrimmed(finalResponse?.id) ?? randomUUID(),
-			finishReason: mergedToolCalls.size > 0 ? 'tool-calls' : 'stop',
-			usage: parseCodexTokenUsage(finalResponse?.usage),
-			message: {
-				role: 'assistant',
-				content,
-				id: toTrimmed(finalResponse?.id),
-			},
+			id: finalResponse?.id,
+			finishReason: finish?.finishReason,
+			usage: finish?.usage,
+			message: { role: 'assistant', content, id: finalResponse?.id },
 			rawResponse: finalResponse,
 			providerMetadata: {
-				model_provider: 'openai-codex',
-				model: toTrimmed(finalResponse?.model) ?? this.modelId,
-				status: toTrimmed(finalResponse?.status) ?? 'completed',
-				id: toTrimmed(finalResponse?.id),
+				model_provider: this.provider,
+				model: finalResponse?.model ?? this.modelId,
+				status: finalResponse?.status,
+				id: finalResponse?.id,
 			},
 		};
 	}
 
 	async *stream(messages: Message[], config?: ChatModelConfig): AsyncIterable<StreamChunk> {
-		const request = this.buildRequest(messages, randomUUID());
-		const stream = await this.openResponsesStream(request, config);
-		const toolCallBuffers: Record<number, { id: string; name: string; argumentsRaw: string }> = {};
-		const emittedToolCalls = new Set<string>();
-		const replayedItems = new Set<string>();
-		const textIndices = new Set<number>();
-		let emittedText = false;
+		yield* this.streamResponse(messages, config);
+	}
+
+	private async *streamResponse(
+		messages: Message[],
+		config?: ChatModelConfig,
+	): AsyncGenerator<StreamChunk, CodexResponsesResponse> {
+		const options = this.resolveInvocationConfig(config);
+		const request = this.buildRequest(messages, randomUUID(), options);
+		const stream = await this.openResponsesStream(request, options);
+		const doneItems = new Map<number, CodexResponsesOutputItem>();
+		const textByIndex = new Map<number, string>();
+		const toolBuffers = new Map<number, CodexResponsesOutputItem>();
 		let reportedModel: string | undefined;
-
 		for await (const event of parseCodexStreamEvents(stream)) {
+			if (options.abortSignal?.aborted)
+				throw options.abortSignal.reason ?? new OperationalError('Codex request was cancelled');
 			assertCodexStreamEvent(event);
-			reportedModel = getReportedModelFromEvent(event) ?? reportedModel;
-			const eventType = toTrimmed(event.type);
-			if (!eventType) continue;
-
-			if (eventType === 'response.output_text.delta') {
-				const delta = toStringValue(event.delta);
-				if (delta) {
-					emittedText = true;
-					textIndices.add(event.output_index ?? 0);
-					yield { type: 'text-delta', delta };
-				}
-				continue;
-			}
-
-			if (
-				eventType === 'response.reasoning_summary_text.delta' ||
-				eventType === 'response.reasoning_text.delta'
+			reportedModel =
+				toTrimmed(event.response?.model) ?? getReportedModelFromEvent(event) ?? reportedModel;
+			assertNoModelSubstitution(this.modelId, { model: reportedModel });
+			const index = event.output_index ?? 0;
+			if (event.type === 'response.output_text.delta') {
+				const delta = toStringValue(event.delta) ?? '';
+				textByIndex.set(index, (textByIndex.get(index) ?? '') + delta);
+				if (delta) yield { type: 'text-delta', delta };
+			} else if (
+				['response.reasoning_summary_text.delta', 'response.reasoning_text.delta'].includes(
+					String(event.type),
+				)
 			) {
-				const delta = toStringValue(event.delta);
-				if (delta) {
-					yield { type: 'reasoning-delta', delta };
-				}
-				continue;
-			}
-
-			if (eventType === 'response.output_item.added') {
-				const item = toObject(event.item);
-				if (!item) continue;
-				if (toTrimmed(item.type) === 'function_call') {
-					const idx = event.output_index ?? 0;
-					toolCallBuffers[idx] = {
-						id: toTrimmed(item.call_id) ?? toTrimmed(item.id) ?? randomUUID(),
-						name: toTrimmed(item.name) ?? 'tool',
-						argumentsRaw: toStringValue(item.arguments) ?? '',
-					};
-				}
-				continue;
-			}
-
-			if (eventType === 'response.function_call_arguments.delta') {
-				const idx = event.output_index ?? 0;
-				const delta = toStringValue(event.delta);
-				if (delta && toolCallBuffers[idx]) {
-					toolCallBuffers[idx].argumentsRaw += delta;
-				}
-				continue;
-			}
-
-			if (eventType === 'response.output_item.done') {
-				const item = toObject(event.item) as CodexResponsesOutputItem | undefined;
-				if (!item) continue;
-				for (const content of codexReplayContent([item])) {
-					const key = JSON.stringify(content);
-					if (!replayedItems.has(key)) {
-						replayedItems.add(key);
-						yield { type: 'content', content };
-					}
-				}
-				const idx = event.output_index ?? 0;
-				if (item.type === 'message' && !textIndices.has(idx)) {
-					const parsed = parseCodexOutputItems([item]);
-					if (parsed.text) {
-						emittedText = true;
-						yield { type: 'text-delta', delta: parsed.text };
-					}
-				}
-				if (item.type !== 'function_call') continue;
-				const buffered = toolCallBuffers[idx];
-				const callId = toTrimmed(item.call_id) ?? buffered?.id;
-				const name = toTrimmed(item.name) ?? buffered?.name;
-				if (!callId || !name || emittedToolCalls.has(callId)) continue;
-				emittedToolCalls.add(callId);
-				yield {
-					type: 'tool-call-delta',
-					id: callId,
-					name,
-					argumentsDelta: toStringValue(item.arguments) || buffered?.argumentsRaw || '{}',
-				};
-				continue;
-			}
-
-			if (
-				eventType === 'response.done' ||
-				eventType === 'response.completed' ||
-				eventType === 'response.failed' ||
-				eventType === 'response.incomplete'
+				if (event.delta)
+					yield { type: 'content', content: { type: 'reasoning', text: event.delta } };
+			} else if (
+				event.type === 'response.output_item.added' &&
+				event.item?.type === 'function_call'
 			) {
-				let response = terminalCodexResponse(event);
-				if (response && reportedModel && !toTrimmed(response.model)) {
-					response = { ...response, model: reportedModel };
-				}
+				toolBuffers.set(index, event.item);
+			} else if (event.type === 'response.function_call_arguments.delta') {
+				const buffered = toolBuffers.get(index);
+				if (!buffered)
+					throw new OperationalError('Codex returned tool argument deltas without a tool call');
+				buffered.arguments = (buffered.arguments ?? '') + (event.delta ?? '');
+			} else if (event.type === 'response.output_item.done') {
+				if (!event.item)
+					throw new OperationalError('Codex returned an empty completed output item');
+				doneItems.set(index, { ...toolBuffers.get(index), ...event.item });
+			} else if (
+				['response.done', 'response.completed', 'response.failed', 'response.incomplete'].includes(
+					String(event.type),
+				)
+			) {
+				const response = terminalCodexResponse(event);
 				assertSuccessfulCodexResponse(response);
-				assertNoModelSubstitution(this.modelId, response);
-				const parsed = parseCodexOutputItems(response?.output);
-				if (!emittedText && parsed.text) yield { type: 'text-delta', delta: parsed.text };
-				for (const content of codexReplayContent(response?.output ?? [])) {
-					if (!replayedItems.has(JSON.stringify(content))) yield { type: 'content', content };
+				if (!response) throw new OperationalError('Codex terminal event is missing its response');
+				const indexedOutput: Array<[number, CodexResponsesOutputItem]> = response.output?.length
+					? response.output.map((item, index) => [index, item])
+					: [...doneItems.entries()].sort(([a], [b]) => a - b);
+				const output = indexedOutput.map(([, item]) => item);
+				response.output = output;
+				response.model ??= reportedModel;
+				const calls = parseCodexOutputItems(output).toolCalls;
+				const allowed = new Set(
+					(
+						request.tools ??
+						request.input.flatMap((item) =>
+							item.type === 'additional_tools'
+								? item.tools.flatMap((namespace) => namespace.tools)
+								: [],
+						)
+					).map((tool) => tool.name),
+				);
+				const ids = new Set<string>();
+				for (const call of calls) {
+					if (!allowed.has(call.name))
+						throw new OperationalError(`Codex requested unbound tool "${call.name}"`);
+					if (ids.has(call.id))
+						throw new OperationalError(`Codex returned duplicate tool call ID "${call.id}"`);
+					ids.add(call.id);
+					parseToolCallArguments(call.argumentsRaw, call.name);
 				}
-				for (const call of parsed.toolCalls) {
-					if (emittedToolCalls.has(call.id)) continue;
-					emittedToolCalls.add(call.id);
+				if (request.tool_choice === 'required' && !calls.length)
+					throw new OperationalError('Codex did not honor forced tool choice');
+				if (request.tool_choice === 'none' && calls.length)
+					throw new OperationalError('Codex returned a tool call while tool choice was disabled');
+				// Only release tool calls after the terminal response has passed all validation.
+				for (const [outputIndex, item] of indexedOutput) {
+					if (item.type === 'message') {
+						const fullText = parseCodexOutputItems([item]).text;
+						const emitted = textByIndex.get(outputIndex) ?? '';
+						if (fullText && !fullText.startsWith(emitted))
+							throw new OperationalError('Codex completed text differs from its streamed text');
+						const remainder = fullText.slice(emitted.length);
+						if (remainder) yield { type: 'text-delta', delta: remainder };
+					}
+					for (const content of codexReplayContent([item])) yield { type: 'content', content };
+				}
+				for (const call of calls)
 					yield {
 						type: 'tool-call-delta',
 						id: call.id,
 						name: call.name,
 						argumentsDelta: call.argumentsRaw,
 					};
-				}
 				yield {
 					type: 'finish',
-					finishReason: emittedToolCalls.size > 0 ? 'tool-calls' : 'stop',
-					usage: parseCodexTokenUsage(response?.usage),
+					finishReason: calls.length ? 'tool-calls' : 'stop',
+					usage: parseCodexTokenUsage(response.usage),
 				};
-				return;
+				return response;
 			}
 		}
-
 		throw new OperationalError('Codex response stream ended before a terminal event');
 	}
 }
@@ -1498,6 +1477,24 @@ function getRuntimeStateKey(context: RuntimeStateContext): string {
 	return `${workflowId}:${nodeId}`;
 }
 
+const stateTransactions = new Map<string, Promise<void>>();
+
+async function withStateTransaction<T>(key: string, action: () => Promise<T>): Promise<T> {
+	const previous = stateTransactions.get(key) ?? Promise.resolve();
+	let release!: () => void;
+	const current = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	stateTransactions.set(key, current);
+	await previous;
+	try {
+		return await action();
+	} finally {
+		release();
+		if (stateTransactions.get(key) === current) stateTransactions.delete(key);
+	}
+}
+
 function getRuntimeState(key: string): RuntimeNodeState {
 	return runtimeNodeState.get(key) ?? {};
 }
@@ -1571,7 +1568,7 @@ function getPersistedStateBaseDir(): string {
 		return configuredPath;
 	}
 
-	const n8nUserFolder = toTrimmed(process.env.N8N_USER_FOLDER) ?? join(homedir(), '.n8n');
+	const n8nUserFolder = join(toTrimmed(process.env.N8N_USER_FOLDER) ?? homedir(), '.n8n');
 	return join(n8nUserFolder, 'openai-codex-state');
 }
 
@@ -1839,21 +1836,31 @@ function normalizePersistedState(value: unknown): RuntimeNodeState {
 
 async function readPersistedState(context: PersistedStateContext): Promise<RuntimeNodeState> {
 	const filePath = getPersistedStateFilePath(context);
-	try {
-		const content = await readFile(filePath, { encoding: 'utf8' });
-		const trimmed = toTrimmed(content);
-		if (!trimmed) return {};
-		return normalizePersistedState(JSON.parse(trimmed));
-	} catch (error) {
-		if (getSystemErrorCode(error) === 'ENOENT') {
-			return {};
-		}
-
-		throw new NodeOperationError(
-			context.getNode(),
-			`Failed to read persisted Codex auth state: ${error instanceof Error ? error.message : String(error)}`,
+	const legacyHome = toTrimmed(process.env.N8N_USER_FOLDER);
+	const paths = [filePath];
+	// Earlier versions interpreted N8N_USER_FOLDER as the .n8n directory itself.
+	if (legacyHome && !toTrimmed(process.env[DIRECT_PERSIST_DIR_ENV]))
+		paths.push(
+			join(
+				legacyHome,
+				'openai-codex-state',
+				`${PERSISTED_STATE_PREFIX}-${sanitizeStateKeySegment(getRuntimeStateKey(context))}.json`,
+			),
 		);
+	for (const path of paths) {
+		try {
+			const content = await readFile(path, { encoding: 'utf8' });
+			const trimmed = toTrimmed(content);
+			return trimmed ? normalizePersistedState(JSON.parse(trimmed)) : {};
+		} catch (error) {
+			if (getSystemErrorCode(error) === 'ENOENT') continue;
+			throw new NodeOperationError(
+				context.getNode(),
+				`Failed to read persisted Codex auth state: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 	}
+	return {};
 }
 
 async function writePersistedState(
@@ -1937,6 +1944,7 @@ async function saveNodeState(
 	nodeStaticData: IDataObject,
 	state: RuntimeNodeState,
 ): Promise<void> {
+	await writePersistedState(context, state);
 	// Migrate secrets written by older releases out of workflow static data. The state file is
 	// local to the n8n instance and is written with owner-only permissions below.
 	delete nodeStaticData.codexAuthJson;
@@ -1947,8 +1955,8 @@ async function saveNodeState(
 	setRuntimeAuthState(runtimeStateKey, state.codexAuthJson);
 	setRuntimeDeviceState(runtimeStateKey, state.codexDeviceAuth);
 	setRuntimeModelsCatalogState(runtimeStateKey, state.modelsCatalog);
-
-	await writePersistedState(context, state);
+	while (runtimeNodeState.size > 256)
+		runtimeNodeState.delete(runtimeNodeState.keys().next().value!);
 }
 
 async function requestDeviceCode(context: AuthRequestContext): Promise<DeviceCodeState> {
@@ -1964,6 +1972,7 @@ async function requestDeviceCode(context: AuthRequestContext): Promise<DeviceCod
 		json: true,
 		returnFullResponse: true,
 		ignoreHttpStatusErrors: true,
+		timeout: 30_000,
 	})) as IN8nHttpFullResponse;
 
 	if (response.statusCode < 200 || response.statusCode > 299) {
@@ -2048,6 +2057,7 @@ async function pollDeviceCode(
 		json: true,
 		returnFullResponse: true,
 		ignoreHttpStatusErrors: true,
+		timeout: 30_000,
 	})) as IN8nHttpFullResponse;
 
 	if (response.statusCode === 403 || response.statusCode === 404) {
@@ -2094,6 +2104,7 @@ async function exchangeAuthorizationCodeForTokens(
 		json: true,
 		returnFullResponse: true,
 		ignoreHttpStatusErrors: true,
+		timeout: 30_000,
 	})) as IN8nHttpFullResponse;
 
 	if (response.statusCode < 200 || response.statusCode > 299) {
@@ -2339,98 +2350,6 @@ function buildModelRequestFailedError(
 	return new OperationalError(details);
 }
 
-function pickSchemaType(typeValue: unknown): string | undefined {
-	if (typeof typeValue === 'string') {
-		const normalized = typeValue.toLowerCase();
-		return normalized === 'integer' ? 'number' : normalized;
-	}
-	if (!Array.isArray(typeValue)) return undefined;
-
-	const normalized = typeValue
-		.filter((entry): entry is string => typeof entry === 'string')
-		.map((entry) => entry.toLowerCase())
-		.filter((entry) => entry !== 'null')
-		.map((entry) => (entry === 'integer' ? 'number' : entry));
-
-	return normalized[0];
-}
-
-function sanitizeToolJsonSchema(rawSchema: unknown): Record<string, unknown> {
-	const schemaObj = toObject(rawSchema);
-	if (!schemaObj) {
-		return {
-			type: 'object',
-			properties: {},
-			additionalProperties: false,
-		};
-	}
-
-	const schemaType = pickSchemaType(schemaObj.type);
-	if (schemaType === 'object' || (!schemaType && toObject(schemaObj.properties))) {
-		const rawProperties = toObject(schemaObj.properties) ?? {};
-		const properties: Record<string, unknown> = {};
-		for (const [key, value] of Object.entries(rawProperties)) {
-			if (key === '__proto__' || key === 'prototype' || key === 'constructor') continue;
-			properties[key] = sanitizeToolJsonSchema(value);
-		}
-
-		const sanitized: Record<string, unknown> = {
-			type: 'object',
-			properties,
-		};
-
-		if (Array.isArray(schemaObj.required)) {
-			const required = schemaObj.required
-				.filter((entry): entry is string => typeof entry === 'string')
-				.filter((entry) => Object.prototype.hasOwnProperty.call(properties, entry));
-			if (required.length > 0) {
-				sanitized.required = required;
-			}
-		} else {
-			const propertyKeys = Object.keys(properties);
-			// ChatGPT codex backend can reject underspecified schemas for simple tools.
-			// If there is a single argument, mark it as required.
-			if (propertyKeys.length === 1) {
-				sanitized.required = propertyKeys;
-			}
-		}
-
-		const additionalProperties = schemaObj.additionalProperties;
-		if (typeof additionalProperties === 'boolean') {
-			sanitized.additionalProperties = additionalProperties;
-		} else if (additionalProperties && typeof additionalProperties === 'object') {
-			sanitized.additionalProperties = sanitizeToolJsonSchema(additionalProperties);
-		} else {
-			sanitized.additionalProperties = false;
-		}
-
-		return sanitized;
-	}
-
-	if (schemaType === 'array') {
-		const description = toTrimmed(schemaObj.description);
-		return {
-			type: 'array',
-			items: sanitizeToolJsonSchema(schemaObj.items),
-			...(description ? { description } : {}),
-		};
-	}
-
-	if (schemaType === 'boolean' || schemaType === 'string' || schemaType === 'number') {
-		const description = toTrimmed(schemaObj.description);
-		return {
-			type: schemaType,
-			...(description ? { description } : {}),
-		};
-	}
-
-	const fallbackDescription = toTrimmed(schemaObj.description);
-	return {
-		type: 'string',
-		...(fallbackDescription ? { description: fallbackDescription } : {}),
-	};
-}
-
 function supportsParallelToolCalls(
 	modelName: string | undefined,
 	modelsCatalog?: ModelsCatalogState,
@@ -2470,7 +2389,10 @@ function setInputDebugState(input: unknown, debugState: BoundToolsDebugState): v
 			debugState.lastInputTypes = undefined;
 		}
 		try {
-			debugState.lastInputPayload = truncateErrorValue(JSON.stringify(input), 500);
+			debugState.lastInputPayload =
+				process.env.N8N_OPENAI_CODEX_DEBUG_PAYLOADS === 'true'
+					? truncateErrorValue(JSON.stringify(input), 500)
+					: undefined;
 		} catch {
 			debugState.lastInputPayload = undefined;
 		}
@@ -2509,8 +2431,11 @@ function isModelSelectionCompatible(requestedModel: string, responseModel: strin
 	const actual = normalizeModelName(responseModel);
 	if (!requested || !actual) return true;
 	if (requested === actual) return true;
-	if (actual.startsWith(`${requested}-`)) return true;
-	if (requested.startsWith(`${actual}-`)) return true;
+	if (
+		actual.startsWith(`${requested}-`) &&
+		/^\d{4}-\d{2}-\d{2}$/.test(actual.slice(requested.length + 1))
+	)
+		return true;
 	return false;
 }
 
@@ -2531,6 +2456,7 @@ async function refreshChatgptTokens(
 	context: AuthRequestContext,
 	auth: CodexAuthJson,
 ): Promise<CodexAuthJson> {
+	auth = deepCloneAuthJson(auth);
 	const tokens = toObject(auth.tokens) as CodexAuthJson['tokens'] | undefined;
 	const refreshToken = toTrimmed(tokens?.refresh_token);
 	if (!tokens || !refreshToken) return auth;
@@ -2551,6 +2477,7 @@ async function refreshChatgptTokens(
 		json: true,
 		returnFullResponse: true,
 		ignoreHttpStatusErrors: true,
+		timeout: 30_000,
 	})) as IN8nHttpFullResponse;
 
 	if (refreshResponse.statusCode < 200 || refreshResponse.statusCode > 299) {
@@ -2569,7 +2496,9 @@ async function refreshChatgptTokens(
 	const refreshBody = normalizeRefreshResponseBody(refreshResponse.body);
 	const refreshPayload = refreshBody as TokenRefreshResponse;
 
-	tokens.access_token = toTrimmed(refreshPayload.access_token) ?? tokens.access_token;
+	const accessToken = toTrimmed(refreshPayload.access_token);
+	if (!accessToken) throw new OperationalError('Token refresh response is missing an access token');
+	tokens.access_token = accessToken;
 	tokens.refresh_token = toTrimmed(refreshPayload.refresh_token) ?? tokens.refresh_token;
 
 	const refreshedIdToken = toTrimmed(refreshPayload.id_token);
@@ -2624,6 +2553,7 @@ async function fetchModelsCatalogFromBackend(
 		json: true,
 		returnFullResponse: true,
 		ignoreHttpStatusErrors: true,
+		timeout: 30_000,
 	})) as IN8nHttpFullResponse;
 
 	if (response.statusCode < 200 || response.statusCode > 299) {
@@ -2654,7 +2584,7 @@ async function fetchModelsCatalogFromBackend(
 	});
 }
 
-async function resolveModelsCatalogForExecution(
+async function resolveModelsCatalogForExecutionUnlocked(
 	stateContext: PersistedStateContext,
 	authContext: AuthRequestContext,
 	runtimeStateKey: string,
@@ -2666,32 +2596,30 @@ async function resolveModelsCatalogForExecution(
 		return mergeWithFallbackCatalog(loadedState.modelsCatalog);
 	}
 
+	auth = loadedState.codexAuthJson ?? auth;
 	const accessToken = resolveAccessToken(auth);
 	const accountId = resolveAccountId(auth);
 	if (!accessToken || !accountId) {
 		return mergeWithFallbackCatalog(loadedState.modelsCatalog);
 	}
 
+	let refreshedCatalog: ModelsCatalogState;
 	try {
-		const refreshedCatalog = await fetchModelsCatalogFromBackend(
-			authContext,
-			accessToken,
-			accountId,
-		);
-		const nextState: RuntimeNodeState = {
-			...loadedState,
-			codexAuthJson: deepCloneAuthJson(auth),
-			codexDeviceAuth: undefined,
-			modelsCatalog: refreshedCatalog,
-		};
-		await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, nextState);
-		return refreshedCatalog;
+		refreshedCatalog = await fetchModelsCatalogFromBackend(authContext, accessToken, accountId);
 	} catch {
 		return mergeWithFallbackCatalog(loadedState.modelsCatalog);
 	}
+	const nextState: RuntimeNodeState = {
+		...loadedState,
+		codexAuthJson: deepCloneAuthJson(auth),
+		codexDeviceAuth: undefined,
+		modelsCatalog: refreshedCatalog,
+	};
+	await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, nextState);
+	return refreshedCatalog;
 }
 
-async function resolveModelsCatalogForLoadOptions(
+async function resolveModelsCatalogForLoadOptionsUnlocked(
 	context: ILoadOptionsFunctions,
 ): Promise<ModelsCatalogState> {
 	const stateContext = context as unknown as PersistedStateContext;
@@ -2712,14 +2640,14 @@ async function resolveModelsCatalogForLoadOptions(
 	if (shouldRefreshAuthTokens(auth)) {
 		try {
 			auth = await refreshChatgptTokens(authContext, auth);
-			// Refresh tokens may rotate even when the subsequent model-catalog request fails.
-			await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
-				...loadedState,
-				codexAuthJson: deepCloneAuthJson(auth),
-			});
 		} catch {
 			return mergeWithFallbackCatalog(loadedState.modelsCatalog);
 		}
+		// Refresh tokens may rotate even when the subsequent model-catalog request fails.
+		await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
+			...loadedState,
+			codexAuthJson: deepCloneAuthJson(auth),
+		});
 	}
 
 	const accessToken = resolveAccessToken(auth);
@@ -2728,22 +2656,19 @@ async function resolveModelsCatalogForLoadOptions(
 		return mergeWithFallbackCatalog(loadedState.modelsCatalog);
 	}
 
+	let refreshedCatalog: ModelsCatalogState;
 	try {
-		const refreshedCatalog = await fetchModelsCatalogFromBackend(
-			authContext,
-			accessToken,
-			accountId,
-		);
-		await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
-			...loadedState,
-			codexAuthJson: deepCloneAuthJson(auth),
-			codexDeviceAuth: undefined,
-			modelsCatalog: refreshedCatalog,
-		});
-		return refreshedCatalog;
+		refreshedCatalog = await fetchModelsCatalogFromBackend(authContext, accessToken, accountId);
 	} catch {
 		return mergeWithFallbackCatalog(loadedState.modelsCatalog);
 	}
+	await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
+		...loadedState,
+		codexAuthJson: deepCloneAuthJson(auth),
+		codexDeviceAuth: undefined,
+		modelsCatalog: refreshedCatalog,
+	});
+	return refreshedCatalog;
 }
 
 type AuthResolveMode = 'blocking' | 'single';
@@ -2774,7 +2699,7 @@ function getRemainingDeviceCodeTtlMs(deviceState: DeviceCodeState): number {
 	return Math.max(0, DEVICE_CODE_EXPIRY_MS - (Date.now() - issuedAtMs));
 }
 
-async function resolveNodeAuthState(
+async function resolveNodeAuthStateUnlocked(
 	stateContext: PersistedStateContext,
 	authContext: AuthRequestContext,
 	runtimeStateKey: string,
@@ -3297,27 +3222,32 @@ export class OpenAiCodexChatModel implements INodeType {
 				serviceTier,
 				parallelToolCalls: supportsParallelToolCalls(modelName, modelsCatalog),
 				useResponsesLite: modelInfo?.useResponsesLite ?? false,
-				refreshAuthHeaders: async () => {
-					const currentState = await loadNodeState(stateContext, runtimeStateKey, nodeStaticData);
-					if (!currentState.codexAuthJson) {
-						throw new OperationalError('Codex auth state is unavailable for token refresh');
-					}
-					const refreshedAuth = await refreshChatgptTokens(authContext, currentState.codexAuthJson);
-					await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
-						...currentState,
-						codexAuthJson: refreshedAuth,
-						codexDeviceAuth: undefined,
-					});
-					const refreshedToken = resolveAccessToken(refreshedAuth);
-					const refreshedAccountId = resolveAccountId(refreshedAuth);
-					if (!refreshedToken || !refreshedAccountId) {
-						throw new OperationalError('Token refresh did not produce usable Codex auth state');
-					}
-					return {
-						Authorization: `Bearer ${refreshedToken}`,
-						...resolveDefaultHeaders(refreshedAccountId),
-					};
-				},
+				refreshAuthHeaders: async (rejectedAuthorization) =>
+					withStateTransaction(runtimeStateKey, async () => {
+						const currentState = await loadNodeState(stateContext, runtimeStateKey, nodeStaticData);
+						if (!currentState.codexAuthJson) {
+							throw new OperationalError('Codex auth state is unavailable for token refresh');
+						}
+						const existingToken = resolveAccessToken(currentState.codexAuthJson);
+						const refreshedAuth =
+							existingToken && `Bearer ${existingToken}` !== rejectedAuthorization
+								? currentState.codexAuthJson
+								: await refreshChatgptTokens(authContext, currentState.codexAuthJson);
+						await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
+							...currentState,
+							codexAuthJson: refreshedAuth,
+							codexDeviceAuth: undefined,
+						});
+						const refreshedToken = resolveAccessToken(refreshedAuth);
+						const refreshedAccountId = resolveAccountId(refreshedAuth);
+						if (!refreshedToken || !refreshedAccountId) {
+							throw new OperationalError('Token refresh did not produce usable Codex auth state');
+						}
+						return {
+							Authorization: `Bearer ${refreshedToken}`,
+							...resolveDefaultHeaders(refreshedAccountId),
+						};
+					}),
 				chatgptAccountId,
 				debugState: boundToolsDebugState,
 				openStreamRequest: async (request, headers, config) => {
@@ -3330,7 +3260,7 @@ export class OpenAiCodexChatModel implements INodeType {
 						encoding: 'stream',
 						ignoreHttpStatusErrors: true,
 						returnFullResponse: true,
-						...(typeof config?.timeout === 'number' ? { timeout: config.timeout } : {}),
+						timeout: typeof config?.timeout === 'number' ? config.timeout : 600_000,
 						...(config?.abortSignal ? { abortSignal: config.abortSignal } : {}),
 					})) as IN8nHttpFullResponse;
 
@@ -3338,9 +3268,47 @@ export class OpenAiCodexChatModel implements INodeType {
 				},
 			});
 
-			return supplyModel(this, codexModel);
+			return supplyCodexModel(this, codexModel);
 		} catch (error) {
 			throw new NodeOperationError(this.getNode(), error as Error);
 		}
 	}
+}
+
+async function resolveNodeAuthState(
+	stateContext: PersistedStateContext,
+	authContext: AuthRequestContext,
+	runtimeStateKey: string,
+	nodeStaticData: IDataObject,
+	mode: AuthResolveMode,
+): Promise<ResolvedAuthState> {
+	return withStateTransaction(runtimeStateKey, () =>
+		resolveNodeAuthStateUnlocked(stateContext, authContext, runtimeStateKey, nodeStaticData, mode),
+	);
+}
+
+async function resolveModelsCatalogForExecution(
+	stateContext: PersistedStateContext,
+	authContext: AuthRequestContext,
+	runtimeStateKey: string,
+	nodeStaticData: IDataObject,
+	auth: CodexAuthJson,
+): Promise<ModelsCatalogState> {
+	return withStateTransaction(runtimeStateKey, () =>
+		resolveModelsCatalogForExecutionUnlocked(
+			stateContext,
+			authContext,
+			runtimeStateKey,
+			nodeStaticData,
+			auth,
+		),
+	);
+}
+
+async function resolveModelsCatalogForLoadOptions(
+	context: ILoadOptionsFunctions,
+): Promise<ModelsCatalogState> {
+	return withStateTransaction(getRuntimeStateKey(context as unknown as RuntimeStateContext), () =>
+		resolveModelsCatalogForLoadOptionsUnlocked(context),
+	);
 }

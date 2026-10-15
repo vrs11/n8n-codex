@@ -1,21 +1,35 @@
 const assert = require('node:assert/strict');
 const { randomUUID } = require('node:crypto');
-const { mkdtempSync, rmSync, readFileSync, statSync } = require('node:fs');
+const { cpSync, mkdtempSync, rmSync, readFileSync, statSync } = require('node:fs');
 const { tmpdir } = require('node:os');
-const { join } = require('node:path');
+const { dirname, join } = require('node:path');
 const { Readable } = require('node:stream');
 const { test, after } = require('node:test');
-const { createRequire } = require('node:module');
+const { createRequire, Module } = require('node:module');
 const sdkRequire = createRequire(require.resolve('@n8n/ai-node-sdk'));
 const { fromLcMessage, toLcMessage } = sdkRequire('@n8n/ai-utilities');
+const lcRequire = createRequire(sdkRequire.resolve('@n8n/ai-utilities'));
+const { HumanMessage, ToolMessage, AIMessage } = lcRequire('@langchain/core/messages');
+const { DynamicStructuredTool } = lcRequire('@langchain/core/tools');
+const { Calculator } = lcRequire('@langchain/community/tools/calculator');
 
+const foreignZodDir = mkdtempSync(join(tmpdir(), 'n8n-codex-foreign-zod-'));
+cpSync(dirname(require.resolve('zod/package.json')), join(foreignZodDir, 'zod'), {
+	recursive: true,
+});
+const foreignRequire = createRequire(join(foreignZodDir, 'fixture.cjs'));
+const zod3 = foreignRequire('./zod').z;
+const zod4 = foreignRequire('./zod/v4').z;
 const stateDir = mkdtempSync(join(tmpdir(), 'n8n-codex-test-'));
 process.env.N8N_OPENAI_CODEX_STATE_DIR = stateDir;
 const {
 	OpenAiCodexChatModel,
 } = require('../dist/nodes/OpenAiCodexChatModel/OpenAiCodexChatModel.node.js');
 const catalog = require('../nodes/OpenAiCodexChatModel/fallback-models.json');
-after(() => rmSync(stateDir, { recursive: true, force: true }));
+after(() => {
+	rmSync(stateDir, { recursive: true, force: true });
+	rmSync(foreignZodDir, { recursive: true, force: true });
+});
 const prompt = [{ role: 'user', content: [{ type: 'text', text: 'Hello' }] }];
 const assistant = (text = 'Hello', phase = 'final_answer') => ({
 	type: 'message',
@@ -36,12 +50,12 @@ const sse = (events) => ({
 function harness({
 	parameters = {},
 	version = 2,
+	id = randomUUID(),
 	remoteModels = catalog.models,
 	responses = [sse([completed()])],
 	auth = true,
 	refresh = {},
 } = {}) {
-	const id = randomUUID();
 	const staticData = auth
 		? {
 				codexAuthJson: {
@@ -106,6 +120,13 @@ function harness({
 		staticData,
 		id,
 		model: async () => (await node.supplyData.call(context, 0)).response.chatModel,
+		adapter: async () => {
+			const adapter = (await node.supplyData.call(context, 0)).response;
+			// The harness has no n8n execution database; keep the public model interface while
+			// disabling execution tracing callbacks. The production adapter retains them.
+			adapter.callbacks = [];
+			return adapter;
+		},
 		requests: () => calls.filter((call) => call.url.endsWith('/responses')),
 	};
 }
@@ -116,6 +137,198 @@ const tool = {
 	description: 'Find an order',
 	inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
 };
+
+for (const [version, z] of [
+	['3', zod3],
+	['4', zod4],
+]) {
+	test(`preserves structured tool arguments from a separate Zod ${version} installation`, async () => {
+		const schema = z.object({
+			query: z.string().describe('Search query'),
+			limit: z.number().min(1).max(20).describe('Number of posts'),
+			includeReplies: z.boolean(),
+			filters: z.object({ tags: z.array(z.string()) }),
+			mode: z.enum(['recent', 'popular']),
+			cursor: z.string().optional(),
+		});
+		assert.notEqual(z.ZodObject, require(version === '3' ? 'zod' : 'zod/v4').z.ZodObject);
+		assert.equal(schema instanceof require('zod').ZodSchema, false);
+		const h = harness();
+		const model = (await h.model()).withTools([
+			{
+				type: 'function',
+				name: 'linkedin_feed',
+				description: 'Get feed posts',
+				inputSchema: schema,
+			},
+		]);
+		await model.generate(prompt);
+		const parameters = h.requests()[0].body.input[0].tools[0].tools[0].parameters;
+		assert.deepEqual(parameters, {
+			type: 'object',
+			properties: {
+				query: { type: 'string', description: 'Search query' },
+				limit: { type: 'number', minimum: 1, maximum: 20, description: 'Number of posts' },
+				includeReplies: { type: 'boolean' },
+				filters: {
+					type: 'object',
+					properties: { tags: { type: 'array', items: { type: 'string' } } },
+					required: ['tags'],
+					...(version === '3' ? { additionalProperties: false } : {}),
+				},
+				mode: { type: 'string', enum: ['recent', 'popular'] },
+				cursor: { type: 'string' },
+			},
+			required: ['query', 'limit', 'includeReplies', 'filters', 'mode'],
+			additionalProperties: false,
+		});
+	});
+
+	test(`keeps Calculator-style primitive text tools compatible with Zod ${version}`, async () => {
+		const h = harness();
+		const model = (await h.model()).withTools([
+			{
+				type: 'function',
+				name: 'calculator',
+				description: 'Calculate',
+				inputSchema: z.string().describe('Math expression'),
+			},
+		]);
+		await model.generate(prompt);
+		assert.deepEqual(h.requests()[0].body.input[0].tools[0].tools[0].parameters, {
+			type: 'object',
+			properties: { input: { type: 'string', description: 'Math expression' } },
+			required: ['input'],
+			additionalProperties: false,
+		});
+	});
+
+	test(`preserves optional single arguments and defaults with Zod ${version}`, async () => {
+		for (const field of [z.number().optional(), z.number().default(5)]) {
+			const h = harness();
+			await (await h.model())
+				.withTools([{ type: 'function', name: 'feed', inputSchema: z.object({ limit: field }) }])
+				.generate(prompt);
+			const parameters = h.requests()[0].body.input[0].tools[0].tools[0].parameters;
+			assert.equal(parameters.required?.includes('limit') ?? false, false);
+			assert.equal(parameters.properties.limit.type, 'number');
+		}
+	});
+
+	for (const [name, inputSchema] of [
+		['date', z.object({ since: z.date() })],
+		[
+			'function',
+			version === '3' ? z.object({ handler: z.function() }) : z.object({ handler: z.custom() }),
+		],
+		['unknown', z.object({ filter: z.unknown() })],
+	]) {
+		test(`rejects unsupported ${name} schemas in Zod ${version} before inference`, async () => {
+			const h = harness();
+			const model = (await h.model()).withTools([
+				{ type: 'function', name: 'invalid_feed', inputSchema },
+			]);
+			await assert.rejects(
+				() => model.generate(prompt),
+				/Cannot convert input schema for tool "invalid_feed"/,
+			);
+			assert.equal(h.requests().length, 0);
+		});
+	}
+}
+
+for (const [version, z] of [
+	['3', zod3],
+	['4', zod4],
+]) {
+	test(`rejects recursive Zod ${version} schemas explicitly`, async () => {
+		let schema;
+		schema = z.object({ child: z.lazy(() => schema) });
+		const h = harness();
+		const model = (await h.model()).withTools([
+			{ type: 'function', name: 'recursive_tool', inputSchema: schema },
+		]);
+		await assert.rejects(
+			() => model.generate(prompt),
+			/Cannot convert input schema for tool "recursive_tool".*[Rr]ecurs|Cannot convert input schema for tool "recursive_tool".*[Cc]ycle/,
+		);
+		assert.equal(h.requests().length, 0);
+	});
+}
+
+test('bundled converter runs without resolving external Zod packages', () => {
+	const filename = join(__dirname, '../dist/nodes/OpenAiCodexChatModel/tool-schema.js');
+	const bundled = new Module(filename);
+	bundled.filename = filename;
+	bundled.paths = [];
+	bundled.require = (name) => {
+		assert.equal(name, 'n8n-workflow', `Unexpected runtime dependency: ${name}`);
+		return require('n8n-workflow');
+	};
+	bundled._compile(readFileSync(filename, 'utf8'), filename);
+	for (const z of [zod3, zod4]) {
+		const parameters = bundled.exports.getCodexToolParameters(
+			z.object({ limit: z.number() }),
+			'feed',
+		);
+		assert.equal(parameters.properties.limit.type, 'number');
+		assert.deepEqual(parameters.required, ['limit']);
+	}
+});
+
+test('preserves JSON Schema arguments, integer types, constraints, and optional fields', async () => {
+	const inputSchema = {
+		type: 'object',
+		properties: {
+			limit: { type: 'integer', minimum: 1, maximum: 100 },
+			status: { type: ['string', 'null'], enum: ['open', null] },
+			payload: { anyOf: [{ type: 'string' }, { type: 'number' }] },
+		},
+		required: ['limit'],
+		additionalProperties: false,
+	};
+	const h = harness();
+	await (await h.model())
+		.withTools([{ type: 'function', name: 'structured', inputSchema }])
+		.generate(prompt);
+	assert.deepEqual(h.requests()[0].body.input[0].tools[0].tools[0].parameters, inputSchema);
+});
+
+test('preserves composed object schemas without closing sibling argument branches', async () => {
+	const inputSchema = {
+		type: 'object',
+		allOf: [
+			{ type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+			{ type: 'object', properties: { limit: { type: 'number' } }, required: ['limit'] },
+		],
+	};
+	const h = harness();
+	await (await h.model())
+		.withTools([{ type: 'function', name: 'combined', inputSchema }])
+		.generate(prompt);
+	assert.deepEqual(h.requests()[0].body.input[0].tools[0].tools[0].parameters, inputSchema);
+});
+
+for (const inputSchema of [
+	undefined,
+	{},
+	{ safeParse() {} },
+	{ type: 'unsupported' },
+	{ type: 'object', properties: { limit: {} } },
+	{ type: 'object', properties: { limit: { $ref: '#/definitions/limit' } } },
+]) {
+	test(`rejects unrecognized tool schemas: ${JSON.stringify(inputSchema)}`, async () => {
+		const h = harness();
+		const model = (await h.model()).withTools([
+			{ type: 'function', name: 'unsupported_tool', inputSchema },
+		]);
+		await assert.rejects(async () => {
+			for await (const _ of model.stream(prompt)) {
+			}
+		}, /Cannot convert input schema for tool "unsupported_tool"/);
+		assert.equal(h.requests().length, 0);
+	});
+}
 
 test('new models match the current CLI catalog and version 1 keeps its default', async () => {
 	for (const version of [1, 2]) {
@@ -162,7 +375,7 @@ test('Responses Lite namespaces tools, preserves names, and puts instructions in
 						name: tool.name,
 						description: tool.description,
 						strict: false,
-						parameters: { ...tool.inputSchema, additionalProperties: false },
+						parameters: tool.inputSchema,
 					},
 				],
 			},
@@ -490,4 +703,714 @@ test('device authorization exchanges the PKCE code and persists authenticated st
 	const model = await h.model();
 	await model.generate(prompt);
 	assert.equal(h.requests()[0].headers.Authorization, 'Bearer test-new-access');
+});
+
+const functionCall = (name, args, id = 'call-1') => ({
+	type: 'function_call',
+	namespace: 'functions',
+	call_id: id,
+	name,
+	arguments: typeof args === 'string' ? args : JSON.stringify(args),
+});
+const publicTool = { name: tool.name, description: tool.description, schema: tool.inputSchema };
+const withoutTracing = (adapter) => {
+	adapter.callbacks = [];
+	return adapter;
+};
+const advertisedTools = (request) =>
+	request.tools ?? request.input.find((x) => x.type === 'additional_tools')?.tools[0].tools ?? [];
+
+test('public adapter binds and executes the real Calculator schema and preserves its transform', async () => {
+	const h = harness({
+		responses: [sse([completed([functionCall('calculator', { input: '2+3' })])])],
+	});
+	const calculator = new Calculator();
+	const adapter = withoutTracing((await h.adapter()).bindTools([calculator]));
+	const result = await adapter.invoke('Calculate 2+3');
+	assert.equal(advertisedTools(h.requests()[0].body)[0].parameters.properties.input.type, 'string');
+	assert.deepEqual(result.tool_calls[0].args, { input: '2+3' });
+	assert.equal(await calculator.invoke(result.tool_calls[0].args), '5');
+});
+
+for (const [version, z] of [
+	['3', zod3],
+	['4', zod4],
+]) {
+	test(`public adapter and DynamicStructuredTool round trip foreign Zod ${version} arguments`, async () => {
+		const args = { query: 'n8n', limit: 3, enabled: true, filters: { tags: ['codex'] } };
+		const schema = z.object({
+			query: z.string(),
+			limit: z.number().int(),
+			enabled: z.boolean(),
+			filters: z.object({ tags: z.array(z.string()) }),
+		});
+		const structured = new DynamicStructuredTool({
+			name: 'feed',
+			description: 'Search feed',
+			schema,
+			func: async (value) => JSON.stringify(value),
+		});
+		const h = harness({
+			responses: [
+				sse([completed([functionCall('feed', args)])]),
+				sse([completed([assistant('Done')])]),
+			],
+		});
+		const adapter = withoutTracing((await h.adapter()).bindTools([structured]));
+		const result = await adapter.invoke('Search');
+		assert.deepEqual(result.tool_calls[0].args, args);
+		const output = await structured.invoke(result.tool_calls[0].args);
+		await adapter.invoke([
+			new HumanMessage('Search'),
+			result,
+			new ToolMessage({ content: output, tool_call_id: 'call-1' }),
+		]);
+		assert.equal(h.requests()[1].body.input.at(-1).output, JSON.stringify(args));
+	});
+}
+
+test('public streaming preserves two independent calls, reasoning, usage and replay metadata', async () => {
+	const calls = [
+		functionCall(tool.name, { id: '1' }, 'one'),
+		functionCall(tool.name, { id: '2' }, 'two'),
+	];
+	const h = harness({
+		responses: [
+			sse([
+				{ type: 'response.reasoning_summary_text.delta', delta: 'Thinking' },
+				{ type: 'response.output_text.delta', output_index: 1, delta: 'Checking' },
+				completed(
+					[
+						{ type: 'reasoning', summary: [], encrypted_content: 'opaque' },
+						assistant('Checking', 'commentary'),
+						...calls,
+					],
+					{ usage: { input_tokens: 10, output_tokens: 4 } },
+				),
+			]),
+		],
+	});
+	const adapter = withoutTracing((await h.adapter()).bindTools([publicTool]));
+	let result;
+	for await (const chunk of await adapter.stream('Check both'))
+		result = result ? result.concat(chunk) : chunk;
+	assert.deepEqual(
+		result.tool_calls.map(({ id, args }) => ({ id, args })),
+		[
+			{ id: 'one', args: { id: '1' } },
+			{ id: 'two', args: { id: '2' } },
+		],
+	);
+	assert.equal(result.usage_metadata.total_tokens, 14);
+	assert.ok(result.content.some((x) => x.type === 'reasoning' && x.reasoning === 'Thinking'));
+	assert.ok(
+		result.response_metadata.codexReplay.some(
+			(x) => x.value.codexReasoningItem?.encrypted_content === 'opaque',
+		),
+	);
+	assert.equal(
+		result.content.some((x) => x.type === 'non_standard'),
+		false,
+	);
+	await adapter.invoke([
+		new HumanMessage('Check both'),
+		result,
+		new ToolMessage({ tool_call_id: 'one', content: 'Found one' }),
+		new ToolMessage({ tool_call_id: 'two', content: 'Found two' }),
+	]);
+	const replay = h.requests()[1].body.input;
+	assert.equal(replay.filter((x) => x.type === 'function_call').length, 2);
+	assert.equal(replay.filter((x) => x.type === 'reasoning')[0].encrypted_content, 'opaque');
+	assert.equal(replay.filter((x) => x.role === 'assistant')[0].phase, 'commentary');
+});
+
+for (const definition of [
+	publicTool,
+	{ name: tool.name, parameters: tool.inputSchema },
+	{ type: 'function', function: { name: tool.name, parameters: tool.inputSchema } },
+	{ type: 'function', name: tool.name, parameters: tool.inputSchema },
+]) {
+	test(`public binding accepts function definition ${JSON.stringify(Object.keys(definition))}`, async () => {
+		const h = harness({ responses: [sse([completed([functionCall(tool.name, { id: '42' })])])] });
+		const adapter = withoutTracing(
+			(await h.adapter()).bindTools([definition], {
+				tool_choice: tool.name,
+				parallel_tool_calls: false,
+			}),
+		);
+		await adapter.invoke('Lookup');
+		assert.equal(h.requests()[0].body.tool_choice, 'required');
+		assert.equal(h.requests()[0].body.parallel_tool_calls, false);
+	});
+}
+
+for (const method of ['functionCalling', 'jsonSchema', 'jsonMode']) {
+	test(`public structured output ${method} parses and validates foreign Zod`, async () => {
+		const args = { count: 2, enabled: true };
+		const h = harness({
+			responses: [
+				sse([
+					completed([
+						method === 'functionCalling'
+							? functionCall('extract', args)
+							: assistant(JSON.stringify(args)),
+					]),
+				]),
+			],
+		});
+		const adapter = await h.adapter();
+		const runnable = adapter.withStructuredOutput(
+			zod4.object({ count: zod4.number().int(), enabled: zod4.boolean() }),
+			{ method },
+		);
+		// The bound model has its own normal n8n callbacks; stub the tracing API below.
+		assert.deepEqual(await runnable.invoke('Extract'), args);
+		if (method !== 'functionCalling')
+			assert.equal(
+				h.requests()[0].body.text.format.type,
+				method === 'jsonMode' ? 'json_object' : 'json_schema',
+			);
+	});
+}
+
+test('public image and tool-result media blocks reach the backend intact', async () => {
+	const h = harness();
+	const adapter = await h.adapter();
+	await adapter.invoke([
+		new HumanMessage({
+			content: [{ type: 'image_url', image_url: { url: 'https://example.com/input.png' } }],
+		}),
+		new AIMessage({
+			content: '',
+			tool_calls: [{ id: 'image-call', name: 'screenshot', args: {} }],
+		}),
+		new ToolMessage({
+			tool_call_id: 'image-call',
+			content: [
+				{ type: 'text', text: 'Screenshot' },
+				{ type: 'image_url', image_url: { url: 'data:image/png;base64,YWJj' } },
+			],
+		}),
+	]);
+	assert.deepEqual(h.requests()[0].body.input.find((x) => x.role === 'user').content, [
+		{ type: 'input_image', image_url: 'https://example.com/input.png' },
+	]);
+	assert.deepEqual(h.requests()[0].body.input.at(-1).output, [
+		{ type: 'input_text', text: 'Screenshot' },
+		{ type: 'input_image', image_url: 'data:image/png;base64,YWJj' },
+	]);
+});
+
+for (const args of ['{broken', '[]', 'null', '"text"']) {
+	test(`invalid arguments ${args} never reach the public tool-call stream`, async () => {
+		const h = harness({ responses: [sse([completed([functionCall(tool.name, args)])])] });
+		const adapter = withoutTracing((await h.adapter()).bindTools([publicTool]));
+		let releasedCalls = 0;
+		await assert.rejects(async () => {
+			for await (const chunk of await adapter.stream('Lookup'))
+				releasedCalls += chunk.tool_calls?.length ?? 0;
+		}, /malformed arguments/);
+		assert.equal(releasedCalls, 0);
+	});
+}
+
+test('failed terminal event never releases executable tool calls', async () => {
+	const item = functionCall(tool.name, { id: '1' });
+	const h = harness({
+		responses: [
+			sse([
+				{ type: 'response.output_item.added', item },
+				{ type: 'response.output_item.done', item },
+				{ type: 'response.failed', response: { error: { message: 'failed turn' } } },
+			]),
+		],
+	});
+	const adapter = withoutTracing((await h.adapter()).bindTools([publicTool]));
+	let calls = 0;
+	await assert.rejects(async () => {
+		for await (const chunk of await adapter.stream('Lookup'))
+			calls += chunk.tool_calls?.length ?? 0;
+	}, /failed turn/);
+	assert.equal(calls, 0);
+});
+
+test('unbound, duplicate, and unnamed returned tool calls are rejected', async () => {
+	for (const output of [
+		[functionCall('unknown', {})],
+		[functionCall(tool.name, {}), functionCall(tool.name, {})],
+		[{ type: 'function_call', arguments: '{}' }],
+	]) {
+		const h = harness({ responses: [sse([completed(output)])] });
+		await assert.rejects(
+			() => (async () => (await h.model()).withTools([tool]).generate(prompt))(),
+			/unbound tool|duplicate tool call|without its ID/,
+		);
+	}
+});
+
+test('duplicate bindings and provider tools fail explicitly', async () => {
+	const adapter = await harness().adapter();
+	assert.throws(() => adapter.bindTools([publicTool, publicTool]), /Duplicate tool/);
+	assert.throws(
+		() => adapter.bindTools([{ type: 'web_search', name: 'web_search' }]),
+		/Provider tool/,
+	);
+});
+
+test('invocation cancellation reaches the HTTP helper and pre-aborted calls never dispatch', async () => {
+	const h = harness();
+	const adapter = await h.adapter();
+	const controller = new AbortController();
+	await adapter.invoke('Hello', { signal: controller.signal });
+	assert.equal(h.requests()[0].abortSignal, controller.signal);
+	controller.abort(new Error('Cancelled by test'));
+	await assert.rejects(() => adapter.invoke('Hello', { signal: controller.signal }), /Cancelled/);
+	assert.equal(h.requests().length, 1);
+});
+
+test('completed output fallback preserves nonconsecutive stream indices without duplicating text', async () => {
+	const h = harness({
+		responses: [
+			sse([
+				{ type: 'response.output_text.delta', output_index: 3, delta: 'Hi' },
+				{ type: 'response.output_item.done', output_index: 3, item: assistant('Hi') },
+				completed([]),
+			]),
+		],
+	});
+	const result = await (await h.adapter()).invoke('Hello');
+	assert.equal(result.text, 'Hi');
+});
+
+test('nearby model names are not accepted as dated snapshots', async () => {
+	const h = harness({ responses: [sse([completed([], { model: 'gpt-5.5-unrequested' })])] });
+	await assert.rejects(() => (async () => (await h.model()).generate(prompt))(), /Model mismatch/);
+});
+
+test('MCP-style schemas inline local JSON references without losing argument constraints', async () => {
+	const h = harness();
+	const schema = {
+		type: 'object',
+		properties: { filters: { $ref: '#/$defs/Filters' }, other: { $ref: '#/$defs/Filters' } },
+		required: ['filters'],
+		$defs: {
+			Filters: {
+				type: 'object',
+				properties: { limit: { type: 'integer', minimum: 1 } },
+				required: ['limit'],
+			},
+		},
+	};
+	await withoutTracing((await h.adapter()).bindTools([{ name: 'mcp_query', schema }])).invoke(
+		'Query',
+	);
+	const parameters = advertisedTools(h.requests()[0].body)[0].parameters;
+	assert.deepEqual(parameters.properties.filters, schema.$defs.Filters);
+	assert.deepEqual(parameters.properties.other, schema.$defs.Filters);
+	assert.equal(JSON.stringify(parameters).includes('$ref'), false);
+});
+
+for (const [version, z] of [
+	['3', zod3],
+	['4', zod4],
+]) {
+	test(`object discriminated unions remain structured in Zod ${version}`, async () => {
+		const h = harness();
+		const schema = z.discriminatedUnion('action', [
+			z.object({ action: z.literal('search'), query: z.string() }),
+			z.object({ action: z.literal('fetch'), id: z.number().int() }),
+		]);
+		await withoutTracing((await h.adapter()).bindTools([{ name: 'dispatch', schema }])).invoke(
+			'Query',
+		);
+		const parameters = advertisedTools(h.requests()[0].body)[0].parameters;
+		assert.equal(parameters.type, 'object');
+		assert.equal(parameters.anyOf[0].properties.query.type, 'string');
+		assert.equal(parameters.anyOf[1].properties.id.type, 'integer');
+	});
+}
+
+test('simultaneous 401s reuse a rotated refresh token instead of refreshing it twice', async () => {
+	const h = harness();
+	const model = await h.model();
+	const original = h.context.helpers.httpRequest;
+	let attempts = 0;
+	let release;
+	const barrier = new Promise((resolve) => {
+		release = resolve;
+	});
+	h.context.helpers.httpRequest = async (options) => {
+		if (
+			options.url.endsWith('/responses') &&
+			options.headers.Authorization === 'Bearer test-access'
+		) {
+			attempts++;
+			if (attempts === 2) release();
+			await barrier;
+			return {
+				statusCode: 401,
+				headers: {},
+				body: Readable.from(['{"error":{"message":"expired"}}']),
+			};
+		}
+		return original(options);
+	};
+	await Promise.all([model.generate(prompt), model.generate(prompt)]);
+	assert.equal(attempts, 2);
+	assert.equal(h.calls.filter((call) => call.url.endsWith('/oauth/token')).length, 1);
+	assert.equal(h.requests().length, 2);
+	assert.ok(h.requests().every((call) => call.headers.Authorization === 'Bearer test-new-access'));
+});
+
+test('simultaneous supply requests refresh stale auth once', async () => {
+	const h = harness();
+	h.staticData.codexAuthJson.last_refresh = '2020-01-01T00:00:00Z';
+	await Promise.all([h.model(), h.model(), h.model()]);
+	assert.equal(h.calls.filter((call) => call.url.endsWith('/oauth/token')).length, 1);
+});
+
+test('malformed refresh responses cannot mark stale credentials as refreshed', async () => {
+	const h = harness({ refresh: { access_token: '' } });
+	h.staticData.codexAuthJson.last_refresh = '2020-01-01T00:00:00Z';
+	await assert.rejects(() => h.model(), /missing an access token/);
+	assert.equal(h.staticData.codexAuthJson.tokens.access_token, 'test-access');
+	assert.equal(h.staticData.codexAuthJson.last_refresh, '2020-01-01T00:00:00Z');
+});
+
+test('errors omit prompt payloads from diagnostics by default', async () => {
+	const h = harness({
+		responses: [{ statusCode: 400, body: { error: { message: 'Invalid request' } } }],
+	});
+	await assert.rejects(
+		() =>
+			(async () =>
+				(await h.model()).generate([
+					{ role: 'user', content: [{ type: 'text', text: 'private-customer-data' }] },
+				]))(),
+		(error) =>
+			!error.message.includes('private-customer-data') && error.message.includes('Invalid request'),
+	);
+});
+
+test('native structured output includes strictness, and includeRaw retains parse failures', async () => {
+	const h = harness({ responses: [sse([completed([assistant('{"count":"bad"}')])])] });
+	const result = await (
+		await h.adapter()
+	)
+		.withStructuredOutput(zod3.object({ count: zod3.number() }), {
+			method: 'jsonSchema',
+			strict: true,
+			includeRaw: true,
+		})
+		.invoke('Extract');
+	assert.equal(result.parsed, null);
+	assert.ok(result.parsing_error);
+	assert.ok(result.raw);
+	assert.equal(h.requests()[0].body.text.format.strict, true);
+});
+
+test('function structured output preserves strict tool configuration', async () => {
+	const h = harness({ responses: [sse([completed([functionCall('extract', { count: 2 })])])] });
+	await (await h.adapter())
+		.withStructuredOutput(zod3.object({ count: zod3.number() }), { strict: true })
+		.invoke('Extract');
+	assert.equal(advertisedTools(h.requests()[0].body)[0].strict, true);
+});
+
+test('rebinding tools replaces the old list and retains forced options used by n8n Agents', async () => {
+	const h = harness({ responses: [sse([completed([functionCall(tool.name, { id: '1' })])])] });
+	const initial = (await h.adapter()).bindTools([publicTool], { tool_choice: 'any' });
+	const rebound = withoutTracing(initial.bindTools([publicTool]));
+	await rebound.invoke('Lookup');
+	assert.equal(advertisedTools(h.requests()[0].body).length, 1);
+	assert.equal(h.requests()[0].body.tool_choice, 'required');
+});
+
+test('real tool-calling AgentExecutor completes a Calculator turn and reuses BufferMemory', async () => {
+	const { createToolCallingAgent, AgentExecutor } = lcRequire('@langchain/classic/agents');
+	const { ChatPromptTemplate } = lcRequire('@langchain/core/prompts');
+	const { BufferMemory } = lcRequire('@langchain/classic/memory');
+	const h = harness({
+		responses: [
+			sse([completed([functionCall('calculator', { input: '2+3' })])]),
+			sse([completed([assistant('The answer is 5')])]),
+			sse([completed([assistant('You calculated 5')])]),
+		],
+	});
+	const tools = [new Calculator()];
+	const agentPrompt = ChatPromptTemplate.fromMessages([
+		['system', 'Use tools when needed'],
+		['placeholder', '{chat_history}'],
+		['human', '{input}'],
+		['placeholder', '{agent_scratchpad}'],
+	]);
+	const agent = createToolCallingAgent({
+		llm: await h.adapter(),
+		tools,
+		prompt: agentPrompt,
+		streamRunnable: false,
+	});
+	const executor = new AgentExecutor({
+		agent,
+		tools,
+		memory: new BufferMemory({
+			memoryKey: 'chat_history',
+			returnMessages: true,
+			inputKey: 'input',
+			outputKey: 'output',
+		}),
+	});
+	const first = await executor.invoke({ input: 'Calculate 2+3' });
+	assert.ok(JSON.stringify(first.output).includes('The answer is 5'));
+	assert.equal(
+		h.requests()[1].body.input.find((x) => x.type === 'function_call_output').output,
+		'5',
+	);
+	await executor.invoke({ input: 'What did we calculate?' });
+	assert.ok(JSON.stringify(h.requests()[2].body.input).includes('The answer is 5'));
+	assert.ok(JSON.stringify(h.requests()[2].body.input).includes('Calculate 2+3'));
+});
+
+test('MCP embedded text and image results and legacy audio retain their data', async () => {
+	const h = harness();
+	const adapter = await h.adapter();
+	await adapter.invoke([
+		new HumanMessage({
+			content: [{ type: 'input_audio', input_audio: { data: 'YWJj', format: 'wav' } }],
+		}),
+		new ToolMessage({
+			tool_call_id: 'call-1',
+			content: [
+				{ type: 'resource', resource: { uri: 'file:///a', text: 'Resource text' } },
+				{ type: 'image', mimeType: 'image/png', data: 'YWJj' },
+			],
+		}),
+	]);
+	assert.equal(
+		h.requests()[0].body.input.find((x) => x.role === 'user').content[0].audio_url,
+		'data:audio/wav;base64,YWJj',
+	);
+	assert.deepEqual(h.requests()[0].body.input.at(-1).output, [
+		{ type: 'input_text', text: 'Resource text' },
+		{ type: 'input_image', image_url: 'data:image/png;base64,YWJj' },
+	]);
+});
+
+test('unknown content and unsupported PDF attachments fail instead of disappearing', async () => {
+	for (const content of [
+		{ type: 'unknown_block', data: 'important' },
+		{ type: 'file', mimeType: 'application/pdf', data: 'YWJj' },
+	]) {
+		const h = harness();
+		const adapter = await h.adapter();
+		await assert.rejects(
+			() => adapter.invoke([new HumanMessage({ content: [content] })]),
+			/Unsupported message content|Unsupported media input/,
+		);
+		assert.equal(h.requests().length, 0);
+	}
+});
+
+test('rate-limit retries respect maxRetries and never retry after streamed output', async () => {
+	const limited = () => ({
+		statusCode: 429,
+		headers: { 'retry-after': '0' },
+		body: Readable.from(['{"error":{"message":"rate limited"}}']),
+	});
+	const h = harness({ responses: [limited(), sse([completed()])] });
+	await (await h.adapter()).invoke('Hi', { maxRetries: 1 });
+	assert.equal(h.requests().length, 2);
+	const noRetry = harness({ responses: [limited()] });
+	await assert.rejects(
+		() => (async () => (await noRetry.adapter()).invoke('Hi', { maxRetries: 0 }))(),
+		/rate limited/,
+	);
+	assert.equal(noRetry.requests().length, 1);
+	const partial = harness({
+		responses: [
+			sse([
+				{ type: 'response.output_text.delta', delta: 'partial' },
+				{ type: 'response.failed', response: { error: { message: 'late failure' } } },
+			]),
+		],
+	});
+	await assert.rejects(
+		() => (async () => (await partial.adapter()).invoke('Hi'))(),
+		/late failure/,
+	);
+	assert.equal(partial.requests().length, 1);
+});
+
+test('n8n execution tracing remains attached through tool binding', async () => {
+	const h = harness({
+		responses: [
+			sse([completed([assistant('Hello')], { usage: { input_tokens: 10, output_tokens: 2 } })]),
+		],
+	});
+	const inputs = [];
+	const outputs = [];
+	const metadata = [];
+	h.context.addInputData = (...args) => {
+		inputs.push(args);
+		return { index: inputs.length - 1 };
+	};
+	h.context.addOutputData = (...args) => outputs.push(args);
+	h.context.setMetadata = (value) => metadata.push(value);
+	h.context.logAiEvent = () => {};
+	h.context.logger = { debug: () => {} };
+	const adapter = (await h.node.supplyData.call(h.context, 0)).response.bindTools([publicTool]);
+	assert.equal(adapter.callbacks[0].name, 'N8nLlmTracing');
+	await adapter.invoke('Hello');
+	assert.equal(inputs.length, 1);
+	assert.equal(outputs.length, 1);
+	assert.ok(metadata.some((x) => x.tracing?.['llm.tokens.total'] === 12));
+});
+
+test('state migration only removes static credentials after a successful disk write', async (t) => {
+	const h = harness();
+	const rename = t.mock.method(require('node:fs/promises'), 'rename', async () => {
+		throw new Error('Simulated disk failure');
+	});
+	await assert.rejects(() => h.model(), /Simulated disk failure/);
+	assert.equal(h.staticData.codexAuthJson.tokens.access_token, 'test-access');
+	rename.mock.restore();
+	await h.model();
+	assert.equal(h.staticData.codexAuthJson, undefined);
+});
+
+test('N8N_USER_FOLDER follows n8n folder semantics and migrates the old state location', async () => {
+	const { mkdirSync, writeFileSync, existsSync } = require('node:fs');
+	const directory = mkdtempSync(join(tmpdir(), 'codex-home-'));
+	const oldStateDir = process.env.N8N_OPENAI_CODEX_STATE_DIR;
+	const oldHome = process.env.N8N_USER_FOLDER;
+	try {
+		delete process.env.N8N_OPENAI_CODEX_STATE_DIR;
+		process.env.N8N_USER_FOLDER = directory;
+		const h = harness({ auth: false });
+		const legacyDirectory = join(directory, 'openai-codex-state');
+		mkdirSync(legacyDirectory);
+		const filename = `.openai-codex-state-test-workflow_${h.id}.json`;
+		writeFileSync(
+			join(legacyDirectory, filename),
+			JSON.stringify({
+				codexAuthJson: {
+					tokens: {
+						access_token: 'old-access',
+						refresh_token: 'old-refresh',
+						account_id: 'test-account',
+					},
+					last_refresh: new Date().toISOString(),
+				},
+			}),
+		);
+		await (await h.model()).generate(prompt);
+		assert.equal(h.requests()[0].headers.Authorization, 'Bearer old-access');
+		assert.ok(existsSync(join(directory, '.n8n', 'openai-codex-state', filename)));
+	} finally {
+		process.env.N8N_OPENAI_CODEX_STATE_DIR = oldStateDir;
+		if (oldHome === undefined) delete process.env.N8N_USER_FOLDER;
+		else process.env.N8N_USER_FOLDER = oldHome;
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test('structured output supports public streaming and keeps tool arguments distinct', async () => {
+	const h = harness({ responses: [sse([completed([functionCall('extract', { count: 3 })])])] });
+	const runnable = (await h.adapter()).withStructuredOutput(zod4.object({ count: zod4.number() }));
+	const chunks = [];
+	for await (const chunk of await runnable.stream('Extract')) chunks.push(chunk);
+	assert.deepEqual(chunks, [{ count: 3 }]);
+});
+
+test('external and recursive JSON Schema references fail before inference', async () => {
+	for (const schema of [
+		{ type: 'object', properties: { a: { $ref: 'https://example.com/schema' } } },
+		{
+			type: 'object',
+			properties: { a: { $ref: '#/$defs/A' } },
+			$defs: { A: { type: 'object', properties: { next: { $ref: '#/$defs/A' } } } },
+		},
+	]) {
+		const h = harness();
+		const adapter = await h.adapter();
+		assert.throws(
+			() => adapter.bindTools([{ name: 'invalid', schema }]),
+			/local JSON Schema references|Recursive JSON Schema reference/,
+		);
+		assert.equal(h.requests().length, 0);
+	}
+});
+
+test('binding strict tools and nested OpenAI JSON response formats preserves their options', async () => {
+	const h = harness();
+	const adapter = withoutTracing(
+		(await h.adapter()).bindTools(
+			[{ ...publicTool, schema: { ...tool.inputSchema, additionalProperties: false } }],
+			{ strict: true },
+		),
+	);
+	await adapter.invoke('Hello', {
+		response_format: {
+			type: 'json_schema',
+			json_schema: {
+				name: 'answer',
+				strict: true,
+				schema: { ...tool.inputSchema, additionalProperties: false },
+			},
+		},
+	});
+	assert.equal(advertisedTools(h.requests()[0].body)[0].strict, true);
+	assert.deepEqual(h.requests()[0].body.text.format, {
+		type: 'json_schema',
+		name: 'answer',
+		strict: true,
+		schema: { ...tool.inputSchema, additionalProperties: false },
+	});
+});
+
+test('open JSON object tool schemas preserve additional arguments instead of becoming zero-argument tools', async () => {
+	const h = harness();
+	await withoutTracing(
+		(await h.adapter()).bindTools([{ name: 'freeform', parameters: { type: 'object' } }]),
+	).invoke('Hi');
+	const parameters = advertisedTools(h.requests()[0].body)[0].parameters;
+	assert.equal(parameters.additionalProperties, undefined);
+	assert.deepEqual(parameters.properties, {});
+});
+
+test('prompt chains interoperate with text and structured LangChain output parsers', async () => {
+	const { ChatPromptTemplate } = lcRequire('@langchain/core/prompts');
+	const { StringOutputParser, StructuredOutputParser } = lcRequire(
+		'@langchain/core/output_parsers',
+	);
+	const h = harness({
+		responses: [
+			sse([completed([assistant('Plain answer')])]),
+			sse([completed([assistant('{"count":4,"enabled":true}')])]),
+		],
+	});
+	const chainPrompt = ChatPromptTemplate.fromMessages([
+		['system', 'Follow workflow rules'],
+		['human', '{question}'],
+	]);
+	const adapter = await h.adapter();
+	const textChain = chainPrompt.pipe(adapter).pipe(new StringOutputParser());
+	assert.equal(await textChain.invoke({ question: 'Answer plainly' }), 'Plain answer');
+	const parser = StructuredOutputParser.fromZodSchema(
+		zod4.object({ count: zod4.number(), enabled: zod4.boolean() }),
+	);
+	const structuredChain = chainPrompt.pipe(adapter).pipe(parser);
+	assert.deepEqual(await structuredChain.invoke({ question: 'Return JSON' }), {
+		count: 4,
+		enabled: true,
+	});
+	assert.ok(
+		h
+			.requests()
+			.every((request) =>
+				request.body.input.some(
+					(item) => item.role === 'developer' && item.content[0].text === 'Follow workflow rules',
+				),
+			),
+	);
 });
