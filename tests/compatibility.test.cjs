@@ -331,7 +331,7 @@ for (const inputSchema of [
 }
 
 test('new models match the current CLI catalog and version 1 keeps its default', async () => {
-	for (const version of [1, 2]) {
+	for (const version of [1, 2, 3]) {
 		const h = harness({ version, remoteModels: null });
 		const model = await h.model();
 		assert.equal(model.modelId, version === 1 ? 'gpt-5.6-sol' : 'gpt-6.1-sol');
@@ -656,6 +656,57 @@ test('catalog lookup persists rotated tokens even when the model request fails',
 	await (await h.model()).generate(prompt);
 	assert.equal(h.requests()[0].headers.Authorization, 'Bearer test-new-access');
 	assert.equal(h.calls.filter((x) => x.url.endsWith('/oauth/token')).length, 1);
+});
+
+test('revoked Codex login gives recovery instructions and Test step starts fresh device login', async () => {
+	for (const code of [
+		'refresh_token_expired',
+		'refresh_token_reused',
+		'refresh_token_invalidated',
+		'invalid_grant',
+	]) {
+		const h = harness();
+		h.staticData.codexAuthJson.last_refresh = '2000-01-01T00:00:00Z';
+		const request = h.context.helpers.httpRequest;
+		h.context.helpers.httpRequest = async (options) =>
+			options.url.endsWith('/oauth/token')
+				? { statusCode: code === 'invalid_grant' ? 400 : 401, body: { error: { code } } }
+				: request(options);
+		await assert.rejects(() => h.model(), /click Test step to sign in again/);
+		assert.equal(
+			h.calls.some((call) => call.url.endsWith('/deviceauth/usercode')),
+			false,
+		);
+		const result = await h.node.execute.call(h.context);
+		assert.equal(result[0][0].json.status, 'pending_verification');
+		assert.equal(result[0][0].json.user_code, 'TEST-CODE');
+		const state = JSON.parse(
+			readFileSync(join(stateDir, `.openai-codex-state-test-workflow_${h.id}.json`), 'utf8'),
+		);
+		assert.equal(state.codexAuthJson, undefined);
+		assert.equal(state.codexDeviceAuth.user_code, 'TEST-CODE');
+	}
+});
+
+test('transient refresh and failed device-login requests never discard the saved login', async () => {
+	for (const scenario of ['transient-refresh', 'device-start-fails']) {
+		const h = harness();
+		h.staticData.codexAuthJson.last_refresh = '2000-01-01T00:00:00Z';
+		const request = h.context.helpers.httpRequest;
+		h.context.helpers.httpRequest = async (options) => {
+			if (options.url.endsWith('/oauth/token'))
+				return scenario === 'transient-refresh'
+					? { statusCode: 503, body: { error: { message: 'Temporary outage' } } }
+					: { statusCode: 401, body: { error: { code: 'refresh_token_invalidated' } } };
+			if (options.url.endsWith('/deviceauth/usercode')) return { statusCode: 503, body: {} };
+			return request(options);
+		};
+		await assert.rejects(
+			() => h.node.execute.call(h.context),
+			/Token refresh failed with status 503|Device-code start failed/,
+		);
+		assert.equal(h.staticData.codexAuthJson.tokens.refresh_token, 'test-refresh');
+	}
 });
 
 test('Flex is accepted without catalog advertising and catalog default tiers are honored', async () => {
@@ -1342,7 +1393,7 @@ test('external and recursive JSON Schema references fail before inference', asyn
 });
 
 test('binding strict tools and nested OpenAI JSON response formats preserves their options', async () => {
-	const h = harness();
+	const h = harness({ responses: [sse([completed([assistant('{"id":"42"}')])])] });
 	const adapter = withoutTracing(
 		(await h.adapter()).bindTools(
 			[{ ...publicTool, schema: { ...tool.inputSchema, additionalProperties: false } }],
@@ -1412,5 +1463,506 @@ test('prompt chains interoperate with text and structured LangChain output parse
 					(item) => item.role === 'developer' && item.content[0].text === 'Follow workflow rules',
 				),
 			),
+	);
+});
+
+const strictSchema = {
+	type: 'object',
+	properties: {
+		answer: { type: 'string' },
+		count: { type: 'integer', minimum: 0 },
+		details: { type: ['string', 'null'] },
+	},
+	required: ['answer', 'count', 'details'],
+	additionalProperties: false,
+};
+const strictValue = { answer: 'Done', count: 2, details: null };
+const strictParameters = {
+	responseFormat: 'jsonSchema',
+	outputSchemaName: 'answer_schema',
+	outputSchema: JSON.stringify(strictSchema),
+};
+const agentFormatter = (schema = strictSchema) => ({
+	name: 'format_final_json_response',
+	description: 'Format the final answer',
+	schema: zod3.object({
+		output:
+			schema === strictSchema
+				? zod3.object({
+						answer: zod3.string(),
+						count: zod3.number().int().min(0),
+						details: zod3.string().nullable(),
+					})
+				: schema,
+	}),
+});
+
+for (const model of ['gpt-6.1-sol', 'gpt-5.5']) {
+	test(`native strict UI format sends text.format and validates final JSON for ${model}`, async () => {
+		const h = harness({
+			parameters: { ...strictParameters, model },
+			responses: [sse([completed([assistant(JSON.stringify(strictValue))])])],
+		});
+		const result = await (await h.adapter()).invoke('Return an answer');
+		assert.deepEqual(JSON.parse(result.text), strictValue);
+		assert.deepEqual(h.requests()[0].body.text.format, {
+			type: 'json_schema',
+			name: 'answer_schema',
+			strict: true,
+			schema: strictSchema,
+		});
+		assert.equal(h.requests()[0].body.text.format.type, 'json_schema');
+	});
+}
+
+test('agent parser mode uses n8n formatter schema with native strict final text and tool arguments', async () => {
+	const args = { output: strictValue };
+	const h = harness({
+		parameters: { responseFormat: 'agentOutputParser' },
+		responses: [sse([completed([functionCall('format_final_json_response', args)])])],
+	});
+	const adapter = withoutTracing((await h.adapter()).bindTools([publicTool, agentFormatter()]));
+	const result = await adapter.invoke('Answer');
+	assert.deepEqual(result.tool_calls[0].args, args);
+	const request = h.requests()[0].body;
+	const formatter = advertisedTools(request).find(
+		(tool) => tool.name === 'format_final_json_response',
+	);
+	assert.equal(formatter.strict, true);
+	assert.equal(request.text.format.strict, true);
+	assert.deepEqual(request.text.format.schema, formatter.parameters);
+	assert.equal(formatter.parameters.properties.output.properties.count.type, 'integer');
+	assert.equal(formatter.parameters.properties.output.additionalProperties, false);
+	assert.equal(request.parallel_tool_calls, false);
+	assert.equal(
+		advertisedTools(request).find((tool) => tool.name === publicTool.name).strict,
+		false,
+	);
+});
+
+test('agent parser mode keeps regular tool turns and validates the final JSON fallback', async () => {
+	const args = { output: strictValue };
+	const h = harness({
+		parameters: { responseFormat: 'agentOutputParser' },
+		responses: [
+			sse([completed([functionCall(publicTool.name, { id: '42' })])]),
+			sse([completed([assistant(JSON.stringify(args))])]),
+		],
+	});
+	const adapter = withoutTracing((await h.adapter()).bindTools([publicTool, agentFormatter()]));
+	const first = await adapter.invoke('Lookup then answer');
+	assert.equal(first.tool_calls[0].name, publicTool.name);
+	const final = await adapter.invoke([
+		new HumanMessage('Lookup then answer'),
+		first,
+		new ToolMessage({ tool_call_id: 'call-1', content: 'Found' }),
+	]);
+	assert.deepEqual(JSON.parse(final.text), args);
+	assert.equal(h.requests().length, 2);
+});
+
+test('agent parser mode without a formatter fails before dispatch instead of using prompt-only formatting', async () => {
+	const h = harness({ parameters: { responseFormat: 'agentOutputParser' } });
+	await assert.rejects(
+		() => (async () => (await h.adapter()).invoke('Answer'))(),
+		/requires an AI Agent/,
+	);
+	assert.equal(h.requests().length, 0);
+});
+
+test('unsupported strict schemas fail before inference without changing ordinary tool schemas', async () => {
+	for (const schema of [
+		{ type: 'object', properties: { optional: { type: 'string' } } },
+		{ type: 'object', properties: {}, additionalProperties: true },
+		{ type: 'object', properties: {}, allOf: [{ type: 'object' }] },
+		{
+			type: 'object',
+			properties: { a: { type: 'array', items: [{ type: 'string' }] } },
+			required: ['a'],
+		},
+		{ type: 'array', items: { type: 'string' } },
+	]) {
+		const h = harness({ parameters: { ...strictParameters, outputSchema: schema } });
+		await assert.rejects(
+			() => h.model(),
+			/required|Free-form|Unsupported strict-schema keyword|Tuple|object at the root/,
+		);
+		assert.equal(h.requests().length, 0);
+	}
+	const normal = harness();
+	await withoutTracing(
+		(await normal.adapter()).bindTools([
+			{ name: 'optional', schema: zod4.object({ value: zod4.string().optional() }) },
+		]),
+	).invoke('Hi');
+	assert.equal(
+		advertisedTools(normal.requests()[0].body)[0].parameters.required?.includes('value') ?? false,
+		false,
+	);
+});
+
+for (const [label, value] of [
+	['wrong type', { ...strictValue, count: '2' }],
+	['missing field', { answer: 'Done', count: 2 }],
+	['extra field', { ...strictValue, extra: true }],
+	['constraint violation', { ...strictValue, count: -1 }],
+]) {
+	test(`native strict mode rejects ${label} in completed responses`, async () => {
+		const h = harness({
+			parameters: strictParameters,
+			responses: [sse([completed([assistant(JSON.stringify(value))])])],
+		});
+		await assert.rejects(
+			() => (async () => (await h.adapter()).invoke('Answer'))(),
+			/does not match strict schema/,
+		);
+	});
+}
+
+test('strict mode buffers partial output until terminal JSON validation succeeds', async () => {
+	const text = JSON.stringify(strictValue);
+	const h = harness({
+		parameters: strictParameters,
+		responses: [
+			sse([
+				{ type: 'response.output_text.delta', output_index: 0, delta: text.slice(0, 12) },
+				{ type: 'response.output_text.delta', output_index: 0, delta: text.slice(12) },
+				completed([assistant(text)]),
+			]),
+		],
+	});
+	let combined;
+	for await (const chunk of await (await h.adapter()).stream('Answer'))
+		combined = combined ? combined.concat(chunk) : chunk;
+	assert.deepEqual(JSON.parse(combined.text), strictValue);
+	const bad = harness({
+		parameters: strictParameters,
+		responses: [
+			sse([
+				{ type: 'response.output_text.delta', delta: '{"count":"wrong"}' },
+				completed([assistant('{"count":"wrong"}')]),
+			]),
+		],
+	});
+	let releasedText = '';
+	await assert.rejects(async () => {
+		for await (const chunk of await (await bad.adapter()).stream('Answer'))
+			releasedText += chunk.text;
+	}, /does not match strict schema/);
+	assert.equal(releasedText, '');
+});
+
+for (const [label, response, pattern] of [
+	[
+		'refusal',
+		completed([
+			{
+				type: 'message',
+				role: 'assistant',
+				content: [{ type: 'refusal', refusal: 'Cannot comply' }],
+			},
+		]),
+		/refused/,
+	],
+	['invalid JSON', completed([assistant('not JSON')]), /invalid JSON/],
+	[
+		'incomplete response',
+		{
+			type: 'response.incomplete',
+			response: { incomplete_details: { reason: 'max_output_tokens' } },
+		},
+		/incomplete/,
+	],
+]) {
+	test(`native strict mode reports ${label} explicitly`, async () => {
+		const h = harness({ parameters: strictParameters, responses: [sse([response])] });
+		await assert.rejects(() => (async () => (await h.adapter()).invoke('Answer'))(), pattern);
+	});
+}
+
+test('invalid strict formatter arguments are never released to the Agent', async () => {
+	const h = harness({
+		parameters: { responseFormat: 'agentOutputParser' },
+		responses: [
+			sse([
+				completed([
+					functionCall('format_final_json_response', { output: { ...strictValue, count: 'bad' } }),
+				]),
+			]),
+		],
+	});
+	const adapter = withoutTracing((await h.adapter()).bindTools([agentFormatter()]));
+	await assert.rejects(() => adapter.invoke('Answer'), /does not match strict schema/);
+});
+
+test('native output settings are opt-in and JSON schema method is strict by default', async () => {
+	const normal = harness();
+	await (await normal.adapter()).invoke('Hello');
+	assert.equal(normal.requests()[0].body.text?.format, undefined);
+	const h = harness({ responses: [sse([completed([assistant(JSON.stringify(strictValue))])])] });
+	assert.deepEqual(
+		await (await h.adapter())
+			.withStructuredOutput(strictSchema, { method: 'jsonSchema' })
+			.invoke('Answer'),
+		strictValue,
+	);
+	assert.equal(h.requests()[0].body.text.format.strict, true);
+});
+
+test('version 3 automatically enforces the connected Agent parser and older versions retain text defaults', async () => {
+	for (const version of [1, 2, 3]) {
+		const h = harness({
+			version,
+			responses: [
+				sse([completed([functionCall('format_final_json_response', { output: strictValue })])]),
+			],
+		});
+		const adapter = withoutTracing((await h.adapter()).bindTools([agentFormatter()]));
+		await adapter.invoke('Answer');
+		const property = h.node.description.properties.find(
+			(p) => p.name === 'responseFormat' && p.displayOptions.show['@version'].includes(version),
+		);
+		assert.equal(property.default, version >= 3 ? 'auto' : 'text');
+		assert.equal(h.requests()[0].body.text?.format?.strict, version >= 3 ? true : undefined);
+		assert.equal(adapter.metadata?.output_format, version >= 3 ? 'json' : undefined);
+	}
+});
+
+test('automatic output uses text without a parser and explicit Text disables automatic enforcement', async () => {
+	for (const parameters of [{}, { responseFormat: 'auto' }, { responseFormat: 'text' }]) {
+		const h = harness({ version: 3, parameters });
+		const adapter = await h.adapter();
+		const bound =
+			parameters.responseFormat === 'text'
+				? withoutTracing(adapter.bindTools([agentFormatter()]))
+				: adapter;
+		assert.equal((await bound.invoke('Hello')).text, 'Hello');
+		assert.equal(h.requests()[0].body.text?.format, undefined);
+		assert.equal(bound.metadata?.output_format, undefined);
+	}
+});
+
+test('automatic mode validates formatter arguments and rejects optional parser fields before dispatch', async () => {
+	const invalid = harness({
+		version: 3,
+		responses: [
+			sse([
+				completed([
+					functionCall('format_final_json_response', { output: { ...strictValue, count: 'bad' } }),
+				]),
+			]),
+		],
+	});
+	await assert.rejects(
+		() =>
+			(async () =>
+				withoutTracing((await invalid.adapter()).bindTools([agentFormatter()])).invoke('Answer'))(),
+		/does not match strict schema/,
+	);
+	const optional = harness({ version: 3 });
+	await assert.rejects(
+		() =>
+			(async () =>
+				withoutTracing(
+					(await optional.adapter()).bindTools([
+						agentFormatter(zod3.object({ value: zod3.string().optional() })),
+					]),
+				).invoke('Answer'))(),
+		/All properties must be required/,
+	);
+	assert.equal(optional.requests().length, 0);
+});
+
+test('forcing an ordinary tool preserves the Agent output schema for this turn', async () => {
+	for (const responseFormat of ['auto', 'agentOutputParser']) {
+		const h = harness({
+			parameters: { responseFormat },
+			responses: [sse([completed([functionCall(publicTool.name, { id: '42' })])])],
+		});
+		await withoutTracing(
+			(await h.adapter()).bindTools([publicTool, agentFormatter()], {
+				tool_choice: publicTool.name,
+			}),
+		).invoke('Lookup');
+		const request = h.requests()[0].body;
+		assert.equal(request.text.format.strict, true);
+		assert.deepEqual(
+			advertisedTools(request).map((tool) => tool.name),
+			[publicTool.name],
+		);
+	}
+});
+
+test('conflicting explicit and Agent output schemas fail instead of bypassing enforcement through the formatter', async () => {
+	const h = harness({ parameters: strictParameters });
+	await assert.rejects(
+		() =>
+			(async () =>
+				withoutTracing((await h.adapter()).bindTools([agentFormatter()])).invoke('Answer'))(),
+		/Output Schema conflicts/,
+	);
+	assert.equal(h.requests().length, 0);
+});
+
+test('matching explicit and Agent output schemas make formatter arguments strict', async () => {
+	const wireSchema = {
+		type: 'object',
+		properties: { output: strictSchema },
+		required: ['output'],
+		additionalProperties: false,
+	};
+	const h = harness({
+		parameters: { ...strictParameters, outputSchema: wireSchema },
+		responses: [
+			sse([completed([functionCall('format_final_json_response', { output: strictValue })])]),
+		],
+	});
+	await withoutTracing((await h.adapter()).bindTools([agentFormatter()])).invoke('Answer');
+	assert.equal(advertisedTools(h.requests()[0].body)[0].strict, true);
+});
+
+test('malformed programmatic response formats fail before inference', async () => {
+	for (const response_format of [
+		'json_schema',
+		{ type: 'json_schema', strict: 'true', schema: strictSchema },
+	]) {
+		const h = harness();
+		await assert.rejects(
+			() => (async () => (await h.adapter()).invoke('Answer', { response_format }))(),
+			/must be an object|must be a boolean/,
+		);
+		assert.equal(h.requests().length, 0);
+	}
+});
+
+test('strict streaming separates commentary from the final schema and preserves it only for replay', async () => {
+	const json = JSON.stringify(strictValue);
+	const h = harness({
+		parameters: strictParameters,
+		responses: [
+			sse([
+				{ type: 'response.output_text.delta', output_index: 0, delta: 'Working...' },
+				{ type: 'response.output_text.delta', output_index: 1, delta: json },
+				completed([assistant('Working...', 'commentary'), assistant(json)]),
+			]),
+		],
+	});
+	let result;
+	for await (const chunk of await (await h.adapter()).stream('Answer'))
+		result = result ? result.concat(chunk) : chunk;
+	assert.deepEqual(JSON.parse(result.text), strictValue);
+	assert.ok(
+		result.response_metadata.codexReplay.some(
+			(block) => block.value.codexMessageItem?.phase === 'commentary',
+		),
+	);
+});
+
+test('formatter final calls cannot be mixed with unfinished tool actions', async () => {
+	const h = harness({
+		parameters: { responseFormat: 'agentOutputParser' },
+		responses: [
+			sse([
+				completed([
+					functionCall(publicTool.name, { id: '42' }, 'lookup'),
+					functionCall('format_final_json_response', { output: strictValue }, 'final'),
+				]),
+			]),
+		],
+	});
+	const adapter = withoutTracing((await h.adapter()).bindTools([publicTool, agentFormatter()]));
+	await assert.rejects(() => adapter.invoke('Answer'), /combined final output formatting/);
+});
+
+test('schema configuration errors and optional Agent schemas fail clearly', async () => {
+	for (const parameters of [
+		{ responseFormat: 'jsonSchema', outputSchema: '{bad' },
+		{ ...strictParameters, outputSchemaName: 'invalid name' },
+	]) {
+		const h = harness({ parameters });
+		await assert.rejects(() => h.model(), /valid JSON|Schema Name/);
+		assert.equal(h.requests().length, 0);
+	}
+	const h = harness({ parameters: { responseFormat: 'agentOutputParser' } });
+	const adapter = withoutTracing(
+		(await h.adapter()).bindTools([
+			agentFormatter(zod3.object({ optional: zod3.string().optional() })),
+		]),
+	);
+	await assert.rejects(() => adapter.invoke('Answer'), /All properties must be required/);
+	assert.equal(h.requests().length, 0);
+});
+
+test('native strict output validates nested arrays, nulls, and supported string formats', async () => {
+	const schema = {
+		type: 'object',
+		properties: {
+			people: {
+				type: 'array',
+				minItems: 1,
+				items: {
+					type: 'object',
+					properties: {
+						email: { type: 'string', format: 'email' },
+						age: { anyOf: [{ type: 'integer', minimum: 0 }, { type: 'null' }] },
+					},
+					required: ['email', 'age'],
+				},
+			},
+		},
+		required: ['people'],
+	};
+	const value = { people: [{ email: 'person@example.com', age: null }] };
+	const h = harness({
+		parameters: { ...strictParameters, outputSchema: schema },
+		responses: [sse([completed([assistant(JSON.stringify(value))])])],
+	});
+	await (await h.adapter()).invoke('Answer');
+	assert.equal(
+		h.requests()[0].body.text.format.schema.properties.people.items.additionalProperties,
+		false,
+	);
+	const invalid = harness({
+		parameters: { ...strictParameters, outputSchema: schema },
+		responses: [sse([completed([assistant('{"people":[{"email":"invalid","age":-1}]}')])])],
+	});
+	await assert.rejects(
+		() => (async () => (await invalid.adapter()).invoke('Answer'))(),
+		/does not match strict schema/,
+	);
+	const unsupported = harness({
+		parameters: {
+			...strictParameters,
+			outputSchema: {
+				type: 'object',
+				properties: { link: { type: 'string', format: 'uri' } },
+				required: ['link'],
+			},
+		},
+	});
+	await assert.rejects(() => unsupported.model(), /Unsupported native string format/);
+});
+
+test('native JSON advertises the metadata n8n Basic LLM Chain uses to return parsed objects', async () => {
+	const h = harness({
+		parameters: strictParameters,
+		responses: [sse([completed([assistant(JSON.stringify(strictValue))])])],
+	});
+	const adapter = await h.adapter();
+	assert.equal(adapter.metadata.output_format, 'json');
+	const { JsonOutputParser } = lcRequire('@langchain/core/output_parsers');
+	assert.deepEqual(await adapter.pipe(new JsonOutputParser()).invoke('Answer'), strictValue);
+	assert.equal((await harness().adapter()).metadata?.output_format, undefined);
+});
+
+test('strict JSON rejects numeric overflow that n8n cannot serialize faithfully', async () => {
+	const schema = { type: 'object', properties: { value: { type: 'number' } }, required: ['value'] };
+	const h = harness({
+		parameters: { ...strictParameters, outputSchema: schema },
+		responses: [sse([completed([assistant('{"value":1e999}')])])],
+	});
+	await assert.rejects(
+		() => (async () => (await h.adapter()).invoke('Answer'))(),
+		/does not match strict schema/,
 	);
 });

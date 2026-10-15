@@ -1,3 +1,5 @@
+import Ajv, { type ValidateFunction } from 'ajv';
+import addFormats from 'ajv-formats';
 import { OperationalError } from 'n8n-workflow';
 import { toJSONSchema, type $ZodType } from 'zod/v4/core';
 import { ignoreOverride, zodToJsonSchema } from 'zod-to-json-schema';
@@ -215,6 +217,7 @@ function convertZod3(schema: unknown): unknown {
 export function getCodexToolParameters(
 	inputSchema: unknown,
 	toolName: string,
+	options: { rootObjectOnly?: boolean } = {},
 ): Record<string, unknown> {
 	try {
 		const schema = record(inputSchema);
@@ -265,6 +268,8 @@ export function getCodexToolParameters(
 			}
 			return normalized;
 		}
+		if (options.rootObjectOnly)
+			throw new Error('Native output schemas must describe an object at the root');
 		if (typeof normalized.type !== 'string' || !JSON_TYPES.has(normalized.type)) {
 			throw new Error(
 				'Top-level tool schema must have an explicit object, array, or primitive type',
@@ -283,5 +288,153 @@ export function getCodexToolParameters(
 		throw new OperationalError(
 			`Cannot convert input schema for tool "${toolName}": ${error instanceof Error ? error.message : String(error)}`,
 		);
+	}
+}
+
+const STRICT_KEYWORDS = new Set([
+	'type',
+	'properties',
+	'required',
+	'additionalProperties',
+	'items',
+	'anyOf',
+	'enum',
+	'const',
+	'description',
+	'title',
+	'$comment',
+	'minLength',
+	'maxLength',
+	'pattern',
+	'format',
+	'minimum',
+	'maximum',
+	'exclusiveMinimum',
+	'exclusiveMaximum',
+	'multipleOf',
+	'minItems',
+	'maxItems',
+]);
+
+/** Build the native strict subset without making optional fields required or nullable implicitly. */
+export function getCodexStrictSchema(input: unknown, name: string): Record<string, unknown> {
+	const schema = getCodexToolParameters(input, name, { rootObjectOnly: true });
+	try {
+		if (schema.type !== 'object' || schema.anyOf)
+			throw new Error('The root must be an object without anyOf');
+		let propertyCount = 0;
+		let enumCount = 0;
+		let stringSize = 0;
+		function visit(node: Record<string, unknown>, path: string, depth: number): void {
+			if (depth > 10) throw new Error(`Schema nesting exceeds 10 levels at ${path}`);
+			for (const key of Object.keys(node))
+				if (!STRICT_KEYWORDS.has(key))
+					throw new Error(`Unsupported strict-schema keyword "${key}" at ${path}`);
+			if (
+				node.format !== undefined &&
+				![
+					'date-time',
+					'time',
+					'date',
+					'duration',
+					'email',
+					'hostname',
+					'ipv4',
+					'ipv6',
+					'uuid',
+				].includes(String(node.format))
+			)
+				throw new Error(`Unsupported native string format "${String(node.format)}" at ${path}`);
+			const types = Array.isArray(node.type) ? node.type : [node.type];
+			if (types.includes('object')) {
+				if (node.additionalProperties !== undefined && node.additionalProperties !== false)
+					throw new Error(`Free-form object properties are not supported at ${path}`);
+				node.additionalProperties = false;
+				const properties = record(node.properties) ?? {};
+				const keys = Object.keys(properties);
+				const required = Array.isArray(node.required) ? node.required : [];
+				if (
+					keys.some((key) => !required.includes(key)) ||
+					required.some((key) => !keys.includes(String(key))) ||
+					new Set(required).size !== required.length
+				)
+					throw new Error(
+						`All properties must be required at ${path}; declare nullable required fields explicitly instead of optional fields`,
+					);
+				node.properties = properties;
+				node.required = required;
+				propertyCount += keys.length;
+				stringSize += keys.join('').length;
+				for (const [key, child] of Object.entries(properties))
+					visit(child as Record<string, unknown>, `${path}.properties.${key}`, depth + 1);
+			}
+			if (node.items) {
+				if (Array.isArray(node.items)) throw new Error(`Tuple arrays are not supported at ${path}`);
+				visit(node.items as Record<string, unknown>, `${path}.items`, depth + 1);
+			}
+			if (Array.isArray(node.anyOf))
+				node.anyOf.forEach((branch, index) =>
+					visit(branch as Record<string, unknown>, `${path}.anyOf[${index}]`, depth),
+				);
+			if (Array.isArray(node.enum)) {
+				enumCount += node.enum.length;
+				const size = node.enum.filter((value) => typeof value === 'string').join('').length;
+				stringSize += size;
+				if (node.enum.length > 250 && size > 15_000)
+					throw new Error(`Enum string values exceed 15000 characters at ${path}`);
+			}
+			if (typeof node.const === 'string') stringSize += node.const.length;
+		}
+		visit(schema, '$', 1);
+		if (propertyCount > 5000 || enumCount > 1000 || stringSize > 120_000)
+			throw new Error('Schema exceeds native strict property, enum, or string-size limits');
+		getValidator(schema);
+		return schema;
+	} catch (error) {
+		// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
+		throw new OperationalError(
+			`Cannot enable native strict output for "${name}": ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+}
+
+const schemaValidators = new Map<string, ValidateFunction>();
+const validator = addFormats(
+	new Ajv({
+		strict: false,
+		strictNumbers: true,
+		allErrors: true,
+		ownProperties: true,
+		addUsedSchema: false,
+	}),
+);
+function getValidator(schema: Record<string, unknown>): ValidateFunction {
+	const key = JSON.stringify(schema);
+	let compiled = schemaValidators.get(key);
+	if (!compiled) {
+		compiled = validator.compile(schema);
+		schemaValidators.set(key, compiled);
+		if (schemaValidators.size > 64) {
+			const oldest = schemaValidators.keys().next().value!;
+			validator.removeSchema(schemaValidators.get(oldest)!.schema);
+			schemaValidators.delete(oldest);
+		}
+	}
+	return compiled;
+}
+
+export function assertCodexSchemaValue(
+	value: unknown,
+	schema: Record<string, unknown>,
+	name: string,
+): void {
+	const validate = getValidator(schema);
+	if (!validate(value)) {
+		// Report paths/constraints, never customer values.
+		const detail = validate.errors
+			?.slice(0, 3)
+			.map((error) => `${error.instancePath || '/'} ${error.message}`)
+			.join('; ');
+		throw new OperationalError(`Codex output does not match strict schema "${name}": ${detail}`);
 	}
 }

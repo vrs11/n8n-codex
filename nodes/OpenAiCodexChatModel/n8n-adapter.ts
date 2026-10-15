@@ -5,9 +5,14 @@ import {
 	type ISupplyDataFunctions,
 	type SupplyData,
 } from 'n8n-workflow';
-import { getCodexToolParameters } from './tool-schema';
+import {
+	getCodexToolParameters,
+	getCodexStrictSchema,
+	assertCodexSchemaValue,
+} from './tool-schema';
 
 export interface CodexModelBridge extends ChatModel {
+	readonly hasNativeJsonOutput: boolean;
 	withTools(tools: Tool[]): CodexModelBridge;
 	withInvocationConfig(options: Record<string, unknown>): CodexModelBridge;
 }
@@ -24,6 +29,7 @@ type LcChunk = {
 type LcResult = { generations: Array<{ message: LcMessage }> };
 type Adapter = {
 	callbacks?: unknown;
+	metadata?: Record<string, unknown>;
 	_generate(messages: LcMessage[], options: Record<string, unknown>): Promise<LcResult>;
 	_streamResponseChunks(
 		messages: LcMessage[],
@@ -171,6 +177,7 @@ export function supplyCodexModel(
 ): SupplyData {
 	const supplied = supplyModel(context, model);
 	const adapter = supplied.response as Adapter;
+	if (model.hasNativeJsonOutput) adapter.metadata = { ...adapter.metadata, output_format: 'json' };
 	const generate = adapter._generate.bind(adapter);
 	const stream = adapter._streamResponseChunks.bind(adapter);
 	adapter._generate = async (messages, options) => {
@@ -211,8 +218,11 @@ export function supplyCodexModel(
 	};
 	adapter.withStructuredOutput = (schema, options = {}) => {
 		const name = typeof options.name === 'string' ? options.name : 'extract';
-		const parameters = getCodexToolParameters(schema, name);
 		const method = options.method ?? 'functionCalling';
+		const strict = options.strict ?? method === 'jsonSchema';
+		const parameters = strict
+			? getCodexStrictSchema(schema, name)
+			: getCodexToolParameters(schema, name);
 		if (!['functionCalling', 'jsonSchema', 'jsonMode'].includes(String(method)))
 			throw new OperationalError(`Unsupported structured output method "${String(method)}"`);
 		const boundModel =
@@ -224,18 +234,19 @@ export function supplyCodexModel(
 								name,
 								description: 'Return the requested structured output',
 								inputSchema: parameters,
-								...(typeof options.strict === 'boolean' ? { strict: options.strict } : {}),
+								...(typeof strict === 'boolean' ? { strict } : {}),
 							},
 						])
 						.withInvocationConfig({ tool_choice: name })
 				: model.withInvocationConfig({
+						codex_output_parser_validates: true,
 						response_format:
 							method === 'jsonMode'
 								? { type: 'json_object' }
 								: {
 										type: 'json_schema',
 										name,
-										strict: options.strict ?? false,
+										strict,
 										schema: parameters,
 									},
 					});
@@ -255,6 +266,7 @@ export function supplyCodexModel(
 				if (method === 'functionCalling' && !call)
 					throw new OperationalError(`Structured output tool "${name}" was not called`);
 				let parsed = method === 'functionCalling' ? call?.args : JSON.parse(text);
+				assertCodexSchemaValue(parsed, parameters, name);
 				const parse = object(schema)?.parseAsync;
 				if (typeof parse === 'function') parsed = await parse.call(schema, parsed);
 				return options.includeRaw ? { raw, parsed } : parsed;

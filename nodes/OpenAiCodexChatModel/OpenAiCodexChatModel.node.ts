@@ -14,7 +14,11 @@ import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { getCodexToolParameters } from './tool-schema';
+import {
+	getCodexToolParameters,
+	getCodexStrictSchema,
+	assertCodexSchemaValue,
+} from './tool-schema';
 import { supplyCodexModel } from './n8n-adapter';
 import packageJson from '../../package.json';
 import fallbackModels from './fallback-models.json';
@@ -236,6 +240,8 @@ const ALLOW_PARALLEL_TOOL_CALLS =
 	toTrimmed(process.env.N8N_OPENAI_CODEX_ALLOW_PARALLEL_TOOLS) !== 'false';
 const MODEL_CATALOG_CACHE_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_INSTRUCTIONS = 'You are Codex.';
+const DEFAULT_OUTPUT_SCHEMA =
+	'{"type":"object","properties":{"result":{"type":"string"}},"required":["result"],"additionalProperties":false}';
 const REQUEST_NORMALIZER_VERSION = '2026-10-15.1';
 
 type CodexResponsesMessageContentItem =
@@ -379,6 +385,9 @@ type CodexResponsesChatModelConfig = {
 	chatgptAccountId: string;
 	openStreamRequest: CodexOpenStreamRequest;
 	debugState: BoundToolsDebugState;
+	outputFormat?: Record<string, unknown>;
+	useAgentOutputParser?: boolean;
+	autoDetectOutputParser?: boolean;
 };
 
 function isAsyncBufferIterable(
@@ -727,7 +736,9 @@ function codexToolFromGenericTool(tool: Tool): CodexResponsesTool | undefined {
 
 	const name = rawName;
 	const description = toTrimmed(tool.description) ?? 'No description';
-	const parameters = getCodexToolParameters(tool.inputSchema, name);
+	const parameters = tool.strict
+		? getCodexStrictSchema(tool.inputSchema, name)
+		: getCodexToolParameters(tool.inputSchema, name);
 
 	return {
 		type: 'function',
@@ -736,6 +747,20 @@ function codexToolFromGenericTool(tool: Tool): CodexResponsesTool | undefined {
 		strict: tool.strict ?? false,
 		parameters,
 	};
+}
+
+function sameJsonSchema(left: unknown, right: unknown): boolean {
+	const canonical = (value: unknown): unknown =>
+		Array.isArray(value)
+			? value.map(canonical)
+			: value && typeof value === 'object'
+				? Object.fromEntries(
+						Object.entries(value)
+							.sort(([a], [b]) => a.localeCompare(b))
+							.map(([key, child]) => [key, canonical(child)]),
+					)
+				: value;
+	return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
 }
 
 function codexReplayContent(items: CodexResponsesOutputItem[]): MessageContent[] {
@@ -849,6 +874,16 @@ class CodexResponsesChatModel extends BaseChatModel {
 		super('openai-codex', modelId);
 	}
 
+	get hasNativeJsonOutput(): boolean {
+		return Boolean(
+			this.config.outputFormat ||
+				this.config.useAgentOutputParser ||
+				(this.config.autoDetectOutputParser &&
+					this.tools.some((tool) => tool.name === 'format_final_json_response')) ||
+				this.invocationOptions.response_format,
+		);
+	}
+
 	withTools(tools: Tool[]): CodexResponsesChatModel {
 		const names = new Set<string>();
 		for (const tool of tools) {
@@ -920,6 +955,28 @@ class CodexResponsesChatModel extends BaseChatModel {
 			if (!normalizedTool) continue;
 			tools.push(normalizedTool);
 		}
+		if (options.response_format !== undefined && !toObject(options.response_format))
+			throw new OperationalError('response_format must be an object');
+		let format = toObject(options.response_format) ?? this.config.outputFormat;
+		// Resolve the parser before forced tool selection narrows this turn's tool list.
+		const formatter = tools.find((tool) => tool.name === 'format_final_json_response');
+		if (
+			!format &&
+			(this.config.useAgentOutputParser || (this.config.autoDetectOutputParser && formatter))
+		) {
+			if (!formatter)
+				throw new OperationalError(
+					'Agent Output Parser (Strict) requires an AI Agent with Require Specific Output Format enabled and a connected Structured Output Parser; use JSON Schema (Strict) for chains',
+				);
+			formatter.parameters = getCodexStrictSchema(formatter.parameters, formatter.name);
+			formatter.strict = true;
+			format = {
+				type: 'json_schema',
+				name: 'n8n_agent_output',
+				strict: true,
+				schema: formatter.parameters,
+			};
+		}
 
 		const choice = options.tool_choice ?? 'auto';
 		const forcedName =
@@ -941,18 +998,36 @@ class CodexResponsesChatModel extends BaseChatModel {
 				: (choice as CodexResponsesRequest['tool_choice']);
 		if (toolChoice === 'required' && tools.length === 0)
 			throw new OperationalError('Forced tool choice requires at least one bound tool');
-		let format = toObject(options.response_format);
 		if (format && !['json_schema', 'json_object'].includes(String(format.type)))
 			throw new OperationalError('Unsupported response_format');
 		if (format?.type === 'json_schema') {
 			const definition = toObject(format.json_schema) ?? format;
+			if (definition.strict !== undefined && typeof definition.strict !== 'boolean')
+				throw new OperationalError('response_format strict must be a boolean');
 			const name = toTrimmed(definition.name) ?? 'extract';
+			if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name))
+				throw new OperationalError(
+					'Output schema name must contain 1–64 letters, digits, underscores, or hyphens',
+				);
 			format = {
 				type: 'json_schema',
 				name,
 				strict: definition.strict ?? false,
-				schema: getCodexToolParameters(definition.schema, name),
+				schema:
+					definition.strict === true
+						? getCodexStrictSchema(definition.schema, name)
+						: getCodexToolParameters(definition.schema, name),
 			};
+			if (formatter && format.strict === true) {
+				const parserSchema = getCodexStrictSchema(formatter.parameters, formatter.name);
+				// Formatting-tool output and final text must obey the same contract.
+				if (!sameJsonSchema(parserSchema, format.schema))
+					throw new OperationalError(
+						'Output Schema conflicts with the AI Agent output parser; select Automatic or Agent Output Parser (Strict) to use the connected parser schema',
+					);
+				formatter.parameters = parserSchema;
+				formatter.strict = true;
+			}
 		}
 		const normalizedInput = toCodexInput(messages);
 		const instructions = normalizedInput.instructions ?? this.config.defaultInstructions;
@@ -1000,7 +1075,8 @@ class CodexResponsesChatModel extends BaseChatModel {
 			parallel_tool_calls:
 				this.config.parallelToolCalls &&
 				options.parallel_tool_calls !== false &&
-				!this.config.useResponsesLite,
+				!this.config.useResponsesLite &&
+				!tools.some((tool) => tool.strict),
 			store: false,
 			include: ['reasoning.encrypted_content'],
 			prompt_cache_key: this.sessionId,
@@ -1163,6 +1239,8 @@ class CodexResponsesChatModel extends BaseChatModel {
 	): AsyncGenerator<StreamChunk, CodexResponsesResponse> {
 		const options = this.resolveInvocationConfig(config);
 		const request = this.buildRequest(messages, randomUUID(), options);
+		const format = request.text?.format;
+		const strictOutput = format?.type === 'json_schema' && format.strict === true;
 		const stream = await this.openResponsesStream(request, options);
 		const doneItems = new Map<number, CodexResponsesOutputItem>();
 		const textByIndex = new Map<number, string>();
@@ -1179,14 +1257,17 @@ class CodexResponsesChatModel extends BaseChatModel {
 			if (event.type === 'response.output_text.delta') {
 				const delta = toStringValue(event.delta) ?? '';
 				textByIndex.set(index, (textByIndex.get(index) ?? '') + delta);
-				if (delta) yield { type: 'text-delta', delta };
+				if (delta && !strictOutput) yield { type: 'text-delta', delta };
 			} else if (
 				['response.reasoning_summary_text.delta', 'response.reasoning_text.delta'].includes(
 					String(event.type),
 				)
 			) {
 				if (event.delta)
-					yield { type: 'content', content: { type: 'reasoning', text: event.delta } };
+					yield {
+						type: 'content',
+						content: { type: 'reasoning', text: event.delta },
+					};
 			} else if (
 				event.type === 'response.output_item.added' &&
 				event.item?.type === 'function_call'
@@ -1216,16 +1297,14 @@ class CodexResponsesChatModel extends BaseChatModel {
 				response.output = output;
 				response.model ??= reportedModel;
 				const calls = parseCodexOutputItems(output).toolCalls;
-				const allowed = new Set(
-					(
-						request.tools ??
-						request.input.flatMap((item) =>
-							item.type === 'additional_tools'
-								? item.tools.flatMap((namespace) => namespace.tools)
-								: [],
-						)
-					).map((tool) => tool.name),
-				);
+				const advertisedTools =
+					request.tools ??
+					request.input.flatMap((item) =>
+						item.type === 'additional_tools'
+							? item.tools.flatMap((namespace) => namespace.tools)
+							: [],
+					);
+				const allowed = new Map(advertisedTools.map((tool) => [tool.name, tool]));
 				const ids = new Set<string>();
 				for (const call of calls) {
 					if (!allowed.has(call.name))
@@ -1233,17 +1312,54 @@ class CodexResponsesChatModel extends BaseChatModel {
 					if (ids.has(call.id))
 						throw new OperationalError(`Codex returned duplicate tool call ID "${call.id}"`);
 					ids.add(call.id);
-					parseToolCallArguments(call.argumentsRaw, call.name);
+					const args = parseToolCallArguments(call.argumentsRaw, call.name);
+					const boundTool = allowed.get(call.name)!;
+					if (boundTool.strict) assertCodexSchemaValue(args, boundTool.parameters, call.name);
 				}
+				if (
+					allowed.get('format_final_json_response')?.strict &&
+					calls.length > 1 &&
+					calls.some((call) => call.name === 'format_final_json_response')
+				)
+					throw new OperationalError(
+						'Codex combined final output formatting with another tool call',
+					);
 				if (request.tool_choice === 'required' && !calls.length)
 					throw new OperationalError('Codex did not honor forced tool choice');
 				if (request.tool_choice === 'none' && calls.length)
 					throw new OperationalError('Codex returned a tool call while tool choice was disabled');
+				if (strictOutput) {
+					if (output.some((item) => item.content?.some((part) => part.type === 'refusal')))
+						throw new OperationalError('Codex refused to produce the requested structured output');
+					if (!calls.length && !options.codex_output_parser_validates) {
+						const finalItems = output.filter(
+							(item) => item.type === 'message' && item.phase !== 'commentary',
+						);
+						let value: unknown;
+						try {
+							value = JSON.parse(parseCodexOutputItems(finalItems).text);
+						} catch {
+							// Model transport has no n8n node context.
+							// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
+							throw new OperationalError(
+								'Codex returned invalid JSON for the requested strict output schema',
+							);
+						}
+						assertCodexSchemaValue(
+							value,
+							format.schema as Record<string, unknown>,
+							String(format.name),
+						);
+					}
+				}
 				// Only release tool calls after the terminal response has passed all validation.
 				for (const [outputIndex, item] of indexedOutput) {
-					if (item.type === 'message') {
+					if (
+						item.type === 'message' &&
+						!(strictOutput && !calls.length && item.phase === 'commentary')
+					) {
 						const fullText = parseCodexOutputItems([item]).text;
-						const emitted = textByIndex.get(outputIndex) ?? '';
+						const emitted = strictOutput ? '' : (textByIndex.get(outputIndex) ?? '');
 						if (fullText && !fullText.startsWith(emitted))
 							throw new OperationalError('Codex completed text differs from its streamed text');
 						const remainder = fullText.slice(emitted.length);
@@ -2171,6 +2287,14 @@ function buildRefreshFailureMessage(body: unknown): string {
 		.join(' ');
 }
 
+class CodexLoginRequiredError extends OperationalError {
+	constructor(code: string) {
+		super(
+			`Codex login expired or was revoked (${code}). Open the Codex node and click Test step to sign in again.`,
+		);
+	}
+}
+
 function resolveDefaultHeaders(chatgptAccountId: string): Record<string, string> {
 	const headers: Record<string, string> = {
 		originator: DEFAULT_ORIGINATOR,
@@ -2481,6 +2605,20 @@ async function refreshChatgptTokens(
 	})) as IN8nHttpFullResponse;
 
 	if (refreshResponse.statusCode < 200 || refreshResponse.statusCode > 299) {
+		const code = extractRefreshTokenErrorCode(refreshResponse.body)?.toLowerCase();
+		if (
+			[400, 401].includes(refreshResponse.statusCode) &&
+			code &&
+			[
+				'refresh_token_expired',
+				'refresh_token_reused',
+				'refresh_token_invalidated',
+				'invalid_grant',
+			].includes(code)
+		)
+			// OperationalError subtype lets Test step distinguish revoked logins from transient failures.
+			// eslint-disable-next-line n8n-nodes-base/node-execute-block-wrong-error-thrown
+			throw new CodexLoginRequiredError(code);
 		if (refreshResponse.statusCode === 401) {
 			throw new OperationalError(buildRefreshFailureMessage(refreshResponse.body));
 		}
@@ -2768,7 +2906,19 @@ async function resolveNodeAuthStateUnlocked(
 	}
 
 	if (shouldRefreshAuthTokens(auth)) {
-		auth = await refreshChatgptTokens(authContext, auth);
+		try {
+			auth = await refreshChatgptTokens(authContext, auth);
+		} catch (error) {
+			if (!(error instanceof CodexLoginRequiredError) || mode !== 'blocking')
+				throw new NodeOperationError(stateContext.getNode(), error as Error);
+			// Only replace revoked credentials after successfully obtaining a new login code.
+			const nextDeviceState = await requestDeviceCode(authContext);
+			await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
+				codexDeviceAuth: nextDeviceState,
+				modelsCatalog: loadedState.modelsCatalog,
+			});
+			return { status: 'pending', deviceState: nextDeviceState, initiated: true };
+		}
 	}
 
 	await saveNodeState(stateContext, runtimeStateKey, nodeStaticData, {
@@ -2935,7 +3085,7 @@ export class OpenAiCodexChatModel implements INodeType {
 			dark: 'file:../../icons/openAiCodex.dark.svg',
 		},
 		group: ['transform'],
-		version: [1, 2],
+		version: [1, 2, 3],
 		subtitle: '={{ $parameter.model }}',
 		description: 'Codex chat model using ChatGPT Codex backend with built-in device-code auth',
 		defaults: {
@@ -2990,7 +3140,7 @@ export class OpenAiCodexChatModel implements INodeType {
 				name: 'model',
 				type: 'options',
 				default: DEFAULT_MODEL,
-				displayOptions: { show: { '@version': [2] } },
+				displayOptions: { show: { '@version': [2, 3] } },
 				options: MODEL_OPTIONS,
 				typeOptions: {
 					loadOptionsMethod: 'getCodexModelOptions',
@@ -3010,6 +3160,54 @@ export class OpenAiCodexChatModel implements INodeType {
 					},
 				},
 				description: 'Custom model slug',
+			},
+			...[false, true].map((automatic) => ({
+				displayName: 'Output Format',
+				name: 'responseFormat',
+				type: 'options' as const,
+				default: automatic ? 'auto' : 'text',
+				displayOptions: { show: { '@version': automatic ? [3] : [1, 2] } },
+				options: [
+					{
+						name: 'Automatic',
+						value: 'auto',
+						description: 'Enforce the connected AI Agent parser schema; use text without a parser',
+					},
+					{
+						name: 'Text',
+						value: 'text',
+						description: 'Leave output formatting to the agent or chain without native enforcement',
+					},
+					{
+						name: 'Agent Output Parser (Strict)',
+						value: 'agentOutputParser',
+						description: 'Enforce the connected AI Agent output parser schema natively',
+					},
+					{
+						name: 'JSON Schema (Strict)',
+						value: 'jsonSchema',
+						description: 'Enforce the JSON Schema entered below natively',
+					},
+				],
+				description: 'Native strict modes enforce the final JSON structure at generation time',
+			})),
+			{
+				displayName: 'Output Schema Name',
+				name: 'outputSchemaName',
+				type: 'string',
+				default: 'codex_output_schema',
+				displayOptions: { show: { responseFormat: ['jsonSchema'] } },
+				description:
+					'Schema identifier containing letters, digits, underscores, or hyphens (up to 64 characters)',
+			},
+			{
+				displayName: 'Output Schema',
+				name: 'outputSchema',
+				type: 'json',
+				default: DEFAULT_OUTPUT_SCHEMA,
+				displayOptions: { show: { responseFormat: ['jsonSchema'] } },
+				description:
+					'JSON Schema for the final response. Every property must be required. Use nullable required fields for optional values. Objects are closed to additional properties.',
 			},
 			{
 				displayName: 'Reasoning Effort Name or ID',
@@ -3205,6 +3403,38 @@ export class OpenAiCodexChatModel implements INodeType {
 			const reasoningConfig = resolveReasoningConfig(this, modelName, modelsCatalog, itemIndex);
 			const verbosity = resolveVerbosity(this, modelName, modelsCatalog, itemIndex);
 			const serviceTier = resolveServiceTier(this, modelName, modelsCatalog, itemIndex);
+			const responseFormat = this.getNodeParameter(
+				'responseFormat',
+				itemIndex,
+				this.getNode().typeVersion >= 3 ? 'auto' : 'text',
+			) as string;
+			if (!['auto', 'text', 'jsonSchema', 'agentOutputParser'].includes(responseFormat))
+				throw new OperationalError('Unsupported Output Format');
+			let outputFormat: Record<string, unknown> | undefined;
+			if (responseFormat === 'jsonSchema') {
+				const name = String(
+					this.getNodeParameter('outputSchemaName', itemIndex, 'codex_output_schema'),
+				);
+				if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name))
+					throw new OperationalError(
+						'Output Schema Name must contain 1–64 letters, digits, underscores, or hyphens',
+					);
+				const raw = this.getNodeParameter('outputSchema', itemIndex, DEFAULT_OUTPUT_SCHEMA);
+				let schema: unknown = raw;
+				if (typeof raw === 'string') {
+					try {
+						schema = JSON.parse(raw);
+					} catch {
+						throw new NodeOperationError(this.getNode(), 'Output Schema must contain valid JSON');
+					}
+				}
+				outputFormat = {
+					type: 'json_schema',
+					name,
+					strict: true,
+					schema: getCodexStrictSchema(schema, name),
+				};
+			}
 			const boundToolsDebugState: BoundToolsDebugState = {
 				toolNames: [],
 			};
@@ -3216,6 +3446,9 @@ export class OpenAiCodexChatModel implements INodeType {
 
 			const codexModel = new CodexResponsesChatModel(modelName, {
 				baseHeaders,
+				outputFormat,
+				useAgentOutputParser: responseFormat === 'agentOutputParser',
+				autoDetectOutputParser: responseFormat === 'auto',
 				defaultInstructions: modelInfo?.baseInstructions ?? DEFAULT_INSTRUCTIONS,
 				reasoning: reasoningConfig,
 				verbosity,
