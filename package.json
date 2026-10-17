@@ -1,6 +1,6 @@
 {
 	"name": "n8n-nodes-openai-codex",
-	"version": "0.4.0",
+	"version": "0.5.0",
 	"description": "n8n AI chat model node for the current ChatGPT Codex Responses backend",
 	"license": "MIT",
 	"keywords": [
@@ -24,6 +24,7 @@
 		"prepublishOnly": "n8n-node prerelease",
 		"test": "pnpm build && node --test tests/*.test.cjs",
 		"test:docker": "pnpm build && node scripts/test-n8n-runtime.mjs",
+		"test:queue": "pnpm build && node scripts/test-queue.mjs",
 		"typecheck": "tsc --noEmit",
 		"sync:models": "node scripts/sync-codex-models.mjs"
 	},
@@ -36,6 +37,9 @@
 		"strict": false,
 		"nodes": [
 			"dist/nodes/OpenAiCodexChatModel/OpenAiCodexChatModel.node.js"
+		],
+		"credentials": [
+			"dist/credentials/OpenAiCodexAccountApi.credentials.js"
 		]
 	},
 	"devDependencies": {
@@ -53,7 +57,7 @@
 		"zod-to-json-schema": "3.25.2"
 	},
 	"peerDependencies": {
-		"@n8n/ai-node-sdk": ">=0.34.0 <0.35.0",
+		"@n8n/ai-node-sdk": ">=0.33.3 <0.35.0",
 		"n8n-workflow": "*"
 	},
 	"engines": {

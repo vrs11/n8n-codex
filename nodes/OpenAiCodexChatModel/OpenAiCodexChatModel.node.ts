@@ -10,7 +10,7 @@ import {
 	type Tool,
 } from '@n8n/ai-node-sdk';
 import { randomUUID } from 'node:crypto';
-import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -20,6 +20,13 @@ import {
 	assertCodexSchemaValue,
 } from './tool-schema';
 import { supplyCodexModel } from './n8n-adapter';
+import {
+	assertLocalAuthentication,
+	CodexAccountProvider,
+	CODEX_MODELS_URL,
+	CodexCredentialError,
+	type CredentialContext,
+} from './codex-credentials';
 import packageJson from '../../package.json';
 import fallbackModels from './fallback-models.json';
 import type {
@@ -121,6 +128,7 @@ type ModelsCatalogState = {
 };
 
 type RuntimeNodeState = {
+	migratedCredentialId?: string;
 	codexAuthJson?: CodexAuthJson;
 	codexDeviceAuth?: DeviceCodeState;
 	modelsCatalog?: ModelsCatalogState;
@@ -381,6 +389,7 @@ type CodexResponsesChatModelConfig = {
 	verbosity?: CodexVerbosity;
 	parallelToolCalls: boolean;
 	useResponsesLite: boolean;
+	handlesAuthRefresh?: boolean;
 	refreshAuthHeaders: (rejectedAuthorization: string) => Promise<Record<string, string>>;
 	chatgptAccountId: string;
 	openStreamRequest: CodexOpenStreamRequest;
@@ -1130,7 +1139,7 @@ class CodexResponsesChatModel extends BaseChatModel {
 				throw config.abortSignal.reason ?? new OperationalError('Codex request was cancelled');
 			const headers = this.buildRequestHeaders(config);
 			response = await this.config.openStreamRequest(request, headers, config);
-			if (response.statusCode === 401 && !refreshed) {
+			if (response.statusCode === 401 && !refreshed && !this.config.handlesAuthRefresh) {
 				await readCodexErrorBody(response.body);
 				Object.assign(
 					this.config.baseHeaders,
@@ -1933,6 +1942,8 @@ function normalizePersistedState(value: unknown): RuntimeNodeState {
 	if (!parsed) return {};
 
 	const state: RuntimeNodeState = {};
+	if (typeof parsed.migratedCredentialId === 'string')
+		state.migratedCredentialId = parsed.migratedCredentialId;
 	if (parsed.codexAuthJson) {
 		state.codexAuthJson = normalizeAuthJson(parsed.codexAuthJson);
 	}
@@ -1989,6 +2000,7 @@ async function writePersistedState(
 		updated_at: new Date().toISOString(),
 	};
 
+	if (state.migratedCredentialId) payload.migratedCredentialId = state.migratedCredentialId;
 	if (state.codexAuthJson) {
 		payload.codexAuthJson = deepCloneAuthJson(state.codexAuthJson) as unknown as IDataObject;
 	}
@@ -2021,6 +2033,25 @@ async function writePersistedState(
 		if (process.platform !== 'win32') {
 			await chmod(filePath, 0o600);
 		}
+		if (
+			state.migratedCredentialId &&
+			toTrimmed(process.env.N8N_USER_FOLDER) &&
+			!toTrimmed(process.env[DIRECT_PERSIST_DIR_ENV])
+		) {
+			const legacyPath = join(
+				process.env.N8N_USER_FOLDER!,
+				'openai-codex-state',
+				`${PERSISTED_STATE_PREFIX}-${sanitizeStateKeySegment(getRuntimeStateKey(context))}.json`,
+			);
+			if (legacyPath !== filePath) {
+				try {
+					await unlink(legacyPath);
+				} catch (error) {
+					if (getSystemErrorCode(error) !== 'ENOENT')
+						throw new NodeOperationError(context.getNode(), error as Error);
+				}
+			}
+		}
 	} catch (error) {
 		throw new NodeOperationError(
 			context.getNode(),
@@ -2037,8 +2068,9 @@ async function loadNodeState(
 	const runtimeState = getRuntimeState(runtimeStateKey);
 	const persistedState = await readPersistedState(context);
 
-	const authRaw =
-		persistedState.codexAuthJson ?? nodeStaticData.codexAuthJson ?? runtimeState.codexAuthJson;
+	const authRaw = persistedState.migratedCredentialId
+		? undefined
+		: (persistedState.codexAuthJson ?? nodeStaticData.codexAuthJson ?? runtimeState.codexAuthJson);
 	const deviceRaw =
 		persistedState.codexDeviceAuth ??
 		nodeStaticData.codexDeviceAuth ??
@@ -2048,6 +2080,7 @@ async function loadNodeState(
 	const modelsCatalog = normalizeModelsCatalogState(modelsCatalogRaw);
 
 	return {
+		migratedCredentialId: persistedState.migratedCredentialId,
 		codexAuthJson: authRaw ? normalizeAuthJson(authRaw) : undefined,
 		codexDeviceAuth: normalizeDeviceCodeState(deviceRaw),
 		modelsCatalog,
@@ -2845,6 +2878,10 @@ async function resolveNodeAuthStateUnlocked(
 	mode: AuthResolveMode,
 ): Promise<ResolvedAuthState> {
 	const loadedState = await loadNodeState(stateContext, runtimeStateKey, nodeStaticData);
+	if (loadedState.migratedCredentialId)
+		throw new OperationalError(
+			'This login was transferred to a Codex Account credential. Select credential authentication on this node.',
+		);
 	let auth = loadedState.codexAuthJson;
 	let deviceState = loadedState.codexDeviceAuth;
 
@@ -3085,7 +3122,7 @@ export class OpenAiCodexChatModel implements INodeType {
 			dark: 'file:../../icons/openAiCodex.dark.svg',
 		},
 		group: ['transform'],
-		version: [1, 2, 3],
+		version: [1, 2, 3, 4],
 		subtitle: '={{ $parameter.model }}',
 		description: 'Codex chat model using ChatGPT Codex backend with built-in device-code auth',
 		defaults: {
@@ -3113,12 +3150,45 @@ export class OpenAiCodexChatModel implements INodeType {
 		],
 		outputs: [NodeConnectionTypes.Main, NodeConnectionTypes.AiLanguageModel],
 		outputNames: ['Status', 'Model'],
+		credentials: [
+			{
+				name: 'openAiCodexAccountApi',
+				required: true,
+				displayOptions: { show: { accountSource: ['credential'] } },
+			},
+		],
 		properties: [
+			...[false, true].map((current) => ({
+				displayName: 'Authentication',
+				name: 'accountSource',
+				type: 'options' as const,
+				noDataExpression: true,
+				default: current ? 'credential' : 'legacy',
+				displayOptions: { show: { '@version': current ? [4] : [1, 2, 3] } },
+				options: [
+					{ name: 'Codex Account Credential', value: 'credential' },
+					{ name: 'Existing Node Login', value: 'legacy' },
+				],
+			})),
+			{
+				displayName: 'Login Action',
+				name: 'loginAction',
+				type: 'options',
+				default: 'test',
+				displayOptions: { show: { accountSource: ['credential'] } },
+				options: [
+					{ name: 'Test / Sign In', value: 'test' },
+					{ name: 'Transfer Existing Login', value: 'transfer' },
+				],
+				description:
+					'Run Test step while workflows using this account are idle. Transfer moves this node’s existing login to an empty transfer credential.',
+			},
 			{
 				// eslint-disable-next-line n8n-nodes-base/node-param-display-name-miscased
 				displayName:
 					'How to login: click <strong>Test step</strong>. If login is required, output shows URL and code. Open that URL, enter the code, then click <strong>Test step</strong> again. Auth is persisted on disk and auto-refreshed.',
 				name: 'usageCallout',
+				displayOptions: { show: { accountSource: ['legacy'] } },
 				type: 'callout',
 				default: '',
 			},
@@ -3140,7 +3210,7 @@ export class OpenAiCodexChatModel implements INodeType {
 				name: 'model',
 				type: 'options',
 				default: DEFAULT_MODEL,
-				displayOptions: { show: { '@version': [2, 3] } },
+				displayOptions: { show: { '@version': [2, 3, 4] } },
 				options: MODEL_OPTIONS,
 				typeOptions: {
 					loadOptionsMethod: 'getCodexModelOptions',
@@ -3166,7 +3236,7 @@ export class OpenAiCodexChatModel implements INodeType {
 				name: 'responseFormat',
 				type: 'options' as const,
 				default: automatic ? 'auto' : 'text',
-				displayOptions: { show: { '@version': automatic ? [3] : [1, 2] } },
+				displayOptions: { show: { '@version': automatic ? [3, 4] : [1, 2] } },
 				options: [
 					{
 						name: 'Automatic',
@@ -3316,6 +3386,15 @@ export class OpenAiCodexChatModel implements INodeType {
 
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
 		try {
+			if (usesCredential(this.getNode())) {
+				const provider = new CodexAccountProvider(this as unknown as CredentialContext);
+				const status =
+					this.getNodeParameter('loginAction', 0, 'test') === 'transfer'
+						? await transferExistingLogin(this, provider)
+						: await provider.testStep();
+				return [this.helpers.returnJsonArray(status)];
+			}
+			assertLocalAuthentication();
 			const runtimeStateKey = getRuntimeStateKey(this as unknown as RuntimeStateContext);
 			const stateContext = this as unknown as PersistedStateContext;
 			const nodeStaticData = this.getWorkflowStaticData('node') as IDataObject;
@@ -3360,13 +3439,23 @@ export class OpenAiCodexChatModel implements INodeType {
 			const stateContext = this as unknown as PersistedStateContext;
 			const authContext = this as unknown as AuthRequestContext;
 			const nodeStaticData = this.getWorkflowStaticData('node') as IDataObject;
-			const resolved = await resolveNodeAuthState(
-				stateContext,
-				authContext,
-				runtimeStateKey,
-				nodeStaticData,
-				'single',
-			);
+			const provider = usesCredential(this.getNode())
+				? new CodexAccountProvider(this as unknown as CredentialContext)
+				: undefined;
+			if (!provider) assertLocalAuthentication();
+			const account = await provider?.current(this.getExecutionCancelSignal());
+			const resolved = account
+				? {
+						status: 'authenticated' as const,
+						auth: { tokens: { access_token: account.accessToken, account_id: account.accountId } },
+					}
+				: await resolveNodeAuthState(
+						stateContext,
+						authContext,
+						runtimeStateKey,
+						nodeStaticData,
+						'single',
+					);
 
 			if (resolved.status === 'pending') {
 				throw new NodeOperationError(
@@ -3391,13 +3480,15 @@ export class OpenAiCodexChatModel implements INodeType {
 				);
 			}
 
-			const modelsCatalog = await resolveModelsCatalogForExecution(
-				stateContext,
-				authContext,
-				runtimeStateKey,
-				nodeStaticData,
-				resolved.auth,
-			);
+			const modelsCatalog = provider
+				? await credentialCatalog(provider)
+				: await resolveModelsCatalogForExecution(
+						stateContext,
+						authContext,
+						runtimeStateKey,
+						nodeStaticData,
+						resolved.auth,
+					);
 			const { modelName } = resolveConfiguredModelName(this, itemIndex);
 			const modelInfo = getModelRecordFromCatalog(modelsCatalog, modelName);
 			const reasoningConfig = resolveReasoningConfig(this, modelName, modelsCatalog, itemIndex);
@@ -3455,6 +3546,7 @@ export class OpenAiCodexChatModel implements INodeType {
 				serviceTier,
 				parallelToolCalls: supportsParallelToolCalls(modelName, modelsCatalog),
 				useResponsesLite: modelInfo?.useResponsesLite ?? false,
+				handlesAuthRefresh: Boolean(provider),
 				refreshAuthHeaders: async (rejectedAuthorization) =>
 					withStateTransaction(runtimeStateKey, async () => {
 						const currentState = await loadNodeState(stateContext, runtimeStateKey, nodeStaticData);
@@ -3484,7 +3576,9 @@ export class OpenAiCodexChatModel implements INodeType {
 				chatgptAccountId,
 				debugState: boundToolsDebugState,
 				openStreamRequest: async (request, headers, config) => {
-					const response = (await this.helpers.httpRequest({
+					const response = (await (
+						provider ? provider.request.bind(provider) : this.helpers.httpRequest
+					)({
 						method: 'POST',
 						url: `${DEFAULT_CHATGPT_CODEX_BASE_URL}/responses`,
 						headers,
@@ -3541,7 +3635,82 @@ async function resolveModelsCatalogForExecution(
 async function resolveModelsCatalogForLoadOptions(
 	context: ILoadOptionsFunctions,
 ): Promise<ModelsCatalogState> {
+	if (usesCredential(context.getNode()))
+		return await credentialCatalog(
+			new CodexAccountProvider(context as unknown as CredentialContext),
+		);
+	assertLocalAuthentication();
 	return withStateTransaction(getRuntimeStateKey(context as unknown as RuntimeStateContext), () =>
 		resolveModelsCatalogForLoadOptionsUnlocked(context),
 	);
+}
+
+function usesCredential(node: INode): boolean {
+	return (
+		(node.parameters.accountSource ?? (node.typeVersion >= 4 ? 'credential' : 'legacy')) ===
+		'credential'
+	);
+}
+const credentialCatalogs = new Map<string, ModelsCatalogState>();
+async function credentialCatalog(provider: CodexAccountProvider): Promise<ModelsCatalogState> {
+	const account = await provider.current();
+	const key = `${provider.id}:${account.accountId}`;
+	const cached = credentialCatalogs.get(key);
+	if (isModelsCatalogFresh(cached)) return cached!;
+	try {
+		const response = await provider.request({
+			method: 'GET',
+			url: CODEX_MODELS_URL,
+			json: true,
+			timeout: 30_000,
+		});
+		if (response.statusCode !== 200) throw new OperationalError('Could not load Codex models');
+		const models = (
+			Array.isArray(toObject(response.body)?.models)
+				? (toObject(response.body)!.models as unknown[])
+				: []
+		)
+			.map(normalizeRemoteModelInfo)
+			.filter((model): model is PersistedModelInfo => Boolean(model));
+		if (!models.length) throw new OperationalError('Codex model catalog is empty');
+		const catalog = mergeWithFallbackCatalog({ fetchedAt: new Date().toISOString(), models });
+		credentialCatalogs.set(key, catalog);
+		if (credentialCatalogs.size > 256)
+			credentialCatalogs.delete(credentialCatalogs.keys().next().value!);
+		return catalog;
+	} catch (error) {
+		// Authentication errors must reach the node execution boundary, never fall back to cached models.
+		// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
+		if (error instanceof CodexCredentialError) throw error;
+		return mergeWithFallbackCatalog(cached);
+	}
+}
+async function transferExistingLogin(
+	context: IExecuteFunctions,
+	provider: CodexAccountProvider,
+): Promise<IDataObject> {
+	assertLocalAuthentication();
+	const key = getRuntimeStateKey(context);
+	return await withStateTransaction(key, async () => {
+		const staticData = context.getWorkflowStaticData('node') as IDataObject;
+		const state = await loadNodeState(context, key, staticData);
+		if (state.migratedCredentialId) {
+			if (state.migratedCredentialId !== provider.id)
+				throw new OperationalError('This node already transferred its login to another credential');
+			const result = await provider.testStep();
+			await saveNodeState(context, key, staticData, { migratedCredentialId: provider.id });
+			return result;
+		}
+		const tokens = state.codexAuthJson?.tokens;
+		if (!tokens?.access_token || !tokens.refresh_token)
+			throw new OperationalError('This node has no existing login to transfer');
+		const seed = {
+			...tokens,
+			id_token: resolveIdTokenRaw(tokens.id_token) ?? '',
+			account_id: resolveAccountId(state.codexAuthJson!) ?? '',
+		} as IDataObject;
+		return await provider.transfer(seed, key, async () => {
+			await saveNodeState(context, key, staticData, { migratedCredentialId: provider.id });
+		});
+	});
 }

@@ -2,9 +2,11 @@
 
 Community n8n AI Chat Model node for the ChatGPT Codex backend.
 
+The 0.5.0 credential implementation is unreleased. It runs on official n8n images without server modifications. Codex Account credentials use OpenAI device-code sign-in and n8n's native OAuth refresh and persistence, including in queue mode. Use the Codex node's **Test step** to verify a saved account; the credential-dialog limitation is described below.
+
 ## Installation
 
-Use Node.js 24 or newer to build this package. The tested runtime is n8n 2.44.1 with AI SDK 0.34.1.
+Use Node.js 24 or newer to build this package. Tested official runtimes are n8n **2.43.5** (AI SDK 0.33.3) and **2.44.1** (AI SDK 0.34.1).
 
 Follow n8n community node installation docs:
 
@@ -15,8 +17,9 @@ Follow n8n community node installation docs:
 - Node name: `OpenAI codex`
 - Type: AI Language Model root node (`ai_languageModel`)
 - Device-code login flow compatible with Codex-style auth endpoints
-- Auth state persisted on disk and reused across runs
-- Owner-only auth-state files (`0600` on POSIX); secrets are not stored in workflow static data
+- Reusable Codex Account credentials encrypted and persisted by n8n (version 4 default)
+- Existing node logins remain supported, with an explicit transfer to credentials
+- Legacy owner-only auth-state files (`0600` on POSIX); secrets are not stored in workflow static data
 - Automatic token refresh before expiry and one refresh/retry after a `401`
 - Authoritative dynamic model catalog from backend `/models`, with the current Codex CLI catalog as offline fallback
 - Current Responses and Responses Lite request formats, including namespaced function tools
@@ -30,23 +33,33 @@ Follow n8n community node installation docs:
 
 ## Login Flow
 
-1. Add the `OpenAI codex` node.
-2. Click **Test step**.
-3. If login is required, the node output/error contains:
-   - verification URL
-   - user code
-4. Complete login in the browser, then click **Test step** again.
+1. Add the `OpenAI codex` node. New version 4 nodes default to **Codex Account Credential** authentication.
+2. Create and save a **Codex Account** credential, select it on the node, and click **Test step**. Open the returned verification URL, enter the code and approve access. Click **Test step** again to complete sign-in. Initial device sign-in also supports **Save/Test → browser approval → Retry** in the credential dialog.
+3. Use the node's **Test step** to verify or reconnect a saved account. Select that same credential on other Codex nodes and workflows. Their executions reuse its stored account; they do not start login flows.
 
-If the login expires or is revoked, workflow execution reports that sign-in is required. Click **Test step** on the same Codex node to obtain a fresh verification URL/code. Temporary authentication-service failures preserve the existing login.
+If a login expires or is revoked, click **Test step** on a node using that credential to reconnect. Run login, reconnect and transfer operations while workflows using the account are idle. **Test step** reuses valid tokens and applies the same refresh policy as workflow execution. The credential dialog does not refresh or rewrite a connected account.
+
+Existing version 1–3 nodes retain **Existing Node Login** authentication. To move one into credentials, create an empty Codex Account with **Account Setup → Transfer Existing Login**, select **Authentication → Codex Account Credential** on the original node, select that credential, choose **Login Action → Transfer Existing Login**, and click **Test step**. The transfer verifies n8n's persisted target before removing the source login. If cleanup fails, retry the transfer. Then change **Login Action** back to **Test / Sign In**. A populated credential containing a different login is rejected.
+
+**Known credential-dialog limitation:** official n8n 2.43.5 and 2.44.1 replace saved OAuth tokens with a presence flag when reopening a credential, then pass that flag into its dialog test. As a result, the dialog can show a failed verification even while the credential works in workflows. The adapter preserves the saved account and directs you to the Codex node's **Test step**, which loads the actual stored tokens and verifies live access. Initial Save/Test/Retry device sign-in still works. No Docker or n8n server patch is required for the supported node-level verification flow.
 
 ## Persistence
+
+Credential mode uses n8n's encrypted credential storage, sharing and permissions. The stock public `refreshOAuth2Token` helper performs token exchange and encrypted persistence; the adapter does not write the credential database. A decision gate keyed by credential ID coordinates refresh decisions within one process. Cross-process refresh uses n8n's native coordination, including its Redis locks in queue mode. The adapter verifies stored results and reuses newer tokens after delayed 401s or competing failures. Valid tokens are reused; refresh happens shortly before known expiry or once after a 401. Refresh failures have a per-process cooldown, and permanent authentication failures require reconnecting. Inference never initiates device login. Model metadata is cached in memory without tokens.
+
+For queue workers, follow [n8n's standard queue configuration](https://docs.n8n.io/hosting/scaling/queue-mode/): use the same PostgreSQL database, Redis configuration and n8n encryption key, and install the node on each process. Select the same Codex Account credential wherever the login is needed. OpenAI device-code sign-in remains the initial authorization method. No custom n8n image or server patch is required. Independent installations with separate credential databases and copied login tokens do not share refresh state. Keep the n8n encryption key and database in your normal encrypted backups.
+
+Refresh inherits stock n8n behavior. In 2.43.5 and 2.44.1, the native helper can proceed without a lock after a ten-second lock acquisition timeout. Slow refreshes and outages can therefore cause competing refresh attempts. The node does not replace that policy or promise that refresh races are impossible. It rereads persisted credentials after refresh failures and can reuse tokens another worker successfully saved. If the issuer invalidates the login, reconnect with **Test step** while workflows using the account are idle.
+
+Legacy node authentication retains its owner-only state files:
 
 - With `N8N_USER_FOLDER` configured: `$N8N_USER_FOLDER/.n8n/openai-codex-state` (matching n8n's folder semantics)
 - Fallback path: `~/.n8n/openai-codex-state`
 - Override path: `N8N_OPENAI_CODEX_STATE_DIR=/absolute/path`
 - The earlier `$N8N_USER_FOLDER/openai-codex-state` location is read for migration when the new file does not exist.
-- Updates for the same workflow/node are serialized within one n8n process, including token rotation and catalog saves. Sharing a state directory between multiple n8n processes is currently unsupported; there is no cross-process lock.
+- Updates for the same workflow/node are serialized within one n8n process. Sharing these files between processes is unsupported.
 - Older releases may have copied auth into workflow static data. The next successful state save migrates it to the local state file and removes the static-data copy.
+- Transferred nodes retain a nonsecret marker and cannot silently recreate their old file login.
 
 ## Conversation Context
 
@@ -63,7 +76,7 @@ Optional environment variables:
 - `N8N_OPENAI_CODEX_CLIENT_VERSION`: override the compatibility version sent to `/models`
 - `N8N_OPENAI_CODEX_ALLOW_PARALLEL_TOOLS=false`: force serial tool calls
 - `CODEX_APP_SERVER_LOGIN_CLIENT_ID`: override the OAuth device-login client ID
-- `CODEX_REFRESH_TOKEN_URL_OVERRIDE`: override the OAuth refresh endpoint
+- `CODEX_REFRESH_TOKEN_URL_OVERRIDE`: override the OAuth refresh endpoint (legacy authentication only)
 
 ## Model Identity Note
 
@@ -83,16 +96,20 @@ pnpm test:docker
 
 `test:docker` checks the compiled artifact in the pinned n8n image, with networking disabled and without host `node_modules`. It requires Docker. Live tests are separate and opt-in; see below.
 
+To check the production 2.43.5 runtime, run `N8N_IMAGE=docker.n8n.io/n8nio/n8n:2.43.5 pnpm test:docker`.
+
+Run `pnpm test:queue` to check a separate main instance and two workers on the official n8n 2.43.5 image with PostgreSQL, Redis and a synthetic HTTPS issuer. Override `N8N_IMAGE` to check another official image. The suite sends real workflow webhooks and exercises shared credentials, expiry, 401 recovery, opaque tokens, native lock timeouts and worker restarts. It uses synthetic accounts and no real OpenAI requests. Test containers and database volumes are removed afterward. Logs remain in the ignored `tests/queue/runtime-*` directories.
+
 ## Compatibility baseline (0.3.0)
 
 Reviewed on 2026-10-15 against freshly pulled upstream code:
 
-| Source | Commit | Version baseline |
-| --- | --- | --- |
+| Source       | Commit                                     | Version baseline                              |
+| ------------ | ------------------------------------------ | --------------------------------------------- |
 | n8n `master` | `e2529a849432bdb3082615c04b1702df61cb91d5` | n8n/workflow 2.44; AI SDK 0.34; node CLI 0.53 |
-| Codex `main` | `d292f721242ef355ce5a38da90e0e33edc4790e6` | CLI compatibility header 0.162.1 |
+| Codex `main` | `d292f721242ef355ce5a38da90e0e33edc4790e6` | CLI compatibility header 0.162.1              |
 
-The installed development dependencies resolve to `@n8n/ai-node-sdk` 0.34.1, `@n8n/node-cli` 0.53.1, and `n8n-workflow` 2.44.1. The minimum baseline is n8n 2.44. The adapter targets AI SDK 0.34.x; its peer range excludes later SDK minor versions until their adapter contracts are checked. The local Compose setup now defaults to n8n 2.44.1.
+The installed development dependencies resolve to `@n8n/ai-node-sdk` 0.34.1, `@n8n/node-cli` 0.53.1, and `n8n-workflow` 2.44.1. Runtime compatibility also passed on official n8n 2.43.5 with AI SDK 0.33.3 and `n8n-workflow` 2.43.3. The peer range accepts the tested SDK 0.33.3–0.34.x series and excludes later minor versions until their adapter contracts are checked. The local Compose setup defaults to official n8n 2.44.1; production can remain on official 2.43.5.
 
 Changes from 0.2.0:
 
@@ -124,12 +141,12 @@ For an AI Agent, enable **Require Specific Output Format**, connect a **Structur
 
 The model's **Output Format** setting also provides explicit overrides:
 
-| Mode | Configuration and behavior |
-| --- | --- |
-| **Automatic** (version 3 default) | Detects the connected AI Agent parser, enforces its formatting-tool arguments and final JSON natively, and allows ordinary tools to run first. Without a parser, uses normal text behavior. Unsupported strict schemas fail before inference. |
-| **Text** (version 1/2 default) | Leaves output formatting to n8n without native schema enforcement. Use this explicitly if a parser requires schema features outside the backend's strict subset. |
-| **Agent Output Parser (Strict)** | On the AI Agent, enable **Require Specific Output Format** and connect a **Structured Output Parser**. The model obtains its schema from n8n's `format_final_json_response` tool, applies `strict: true` to that tool, and sends the same schema in `text.format` as strict JSON Schema. Regular tools can run before the final response. |
-| **JSON Schema (Strict)** | Enter **Output Schema** and an optional **Output Schema Name** on the model. This works with Basic LLM Chain and other model consumers without a separate output parser. The model advertises JSON output metadata so Basic LLM Chain returns a parsed object. |
+| Mode                                | Configuration and behavior                                                                                                                                                                                                                                                                                                                |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Automatic** (version 3/4 default) | Detects the connected AI Agent parser, enforces its formatting-tool arguments and final JSON natively, and allows ordinary tools to run first. Without a parser, uses normal text behavior. Unsupported strict schemas fail before inference.                                                                                             |
+| **Text** (version 1/2 default)      | Leaves output formatting to n8n without native schema enforcement. Use this explicitly if a parser requires schema features outside the backend's strict subset.                                                                                                                                                                          |
+| **Agent Output Parser (Strict)**    | On the AI Agent, enable **Require Specific Output Format** and connect a **Structured Output Parser**. The model obtains its schema from n8n's `format_final_json_response` tool, applies `strict: true` to that tool, and sends the same schema in `text.format` as strict JSON Schema. Regular tools can run before the final response. |
+| **JSON Schema (Strict)**            | Enter **Output Schema** and an optional **Output Schema Name** on the model. This works with Basic LLM Chain and other model consumers without a separate output parser. The model advertises JSON output metadata so Basic LLM Chain returns a parsed object.                                                                            |
 
 n8n gives a custom model control over its HTTP request, tool binding, model settings and LangChain interface. Its Agent passes the connected parser schema in a formatting tool; Basic LLM Chain only supplies formatting instructions and applies its parser afterward. The model cannot obtain a Chain parser's schema from that prompt reliably, so configure it explicitly on the model. No changes to n8n itself are required.
 
@@ -137,13 +154,13 @@ For a simple chain, select **JSON Schema (Strict)** and enter:
 
 ```json
 {
-  "type": "object",
-  "properties": {
-    "answer": { "type": "string" },
-    "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
-  },
-  "required": ["answer", "confidence"],
-  "additionalProperties": false
+	"type": "object",
+	"properties": {
+		"answer": { "type": "string" },
+		"confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+	},
+	"required": ["answer", "confidence"],
+	"additionalProperties": false
 }
 ```
 
@@ -171,26 +188,29 @@ Unsupported, unconstrained, malformed, or recursive schemas fail before inferenc
 
 Conversion uses the [Zod JSON Schema API](https://zod.dev/json-schema) for Zod 4 and [zod-to-json-schema](https://github.com/StefanTerdell/zod-to-json-schema) for Zod 3. Regression tests load a real separate Zod installation and check both conversion and rejection paths.
 
-
 ## Integration audit and verified coverage
 
 The 2026-10-15 audit found correctness gaps in both the node and the SDK adapter it used. Existing tests mostly called the underlying model directly and missed behavior at the public LangChain interface. The adapter now keeps n8n tracing while correcting these paths:
 
-| Issue found | Result after correction |
-| --- | --- |
-| Tool schemas lost across Zod copies; Calculator transforms rejected | Convert schema inputs structurally; preserve named arguments and input transforms; reject unsupported schemas explicitly |
-| `bindTools` options ignored and repeated bindings duplicated tools | Preserve forced choice, strictness and parallel-call options; replace the previous tool list |
-| Every streamed tool call used index zero | Assign distinct indices so LangChain aggregation preserves independent calls |
-| Malformed arguments became `{}`; calls could escape failed streams | Validate object arguments, names, IDs, advertised tools and terminal status before exposing tool calls |
-| Replay records entered visible content and broke standard text output parsers | Keep opaque replay records in message metadata and restore them for subsequent model turns |
-| Structured output depended on incomplete SDK defaults | Support function calling, native JSON Schema, JSON mode, Zod parsing and `includeRaw`, including streaming |
-| Legacy images, audio and tool-result media were lost | Normalize supported content before SDK conversion and send structured tool-result content |
-| Concurrent token refreshes could rotate twice or overwrite newer credentials | Serialize state transactions; reuse tokens already refreshed by another execution; persist before deleting legacy credentials |
-| Error diagnostics automatically included prompt excerpts | Payload diagnostics are opt-in via `N8N_OPENAI_CODEX_DEBUG_PAYLOADS=true` |
-| Loose model-name comparisons accepted unrelated variants | Accept exact model IDs and dated snapshots only |
-| Rate limits lacked bounded retry handling | Honor `maxRetries` (0–5, default 2) for transient HTTP statuses before a successful stream; honor cancellation and bounded Retry-After delays |
+| Issue found                                                                   | Result after correction                                                                                                                       |
+| ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tool schemas lost across Zod copies; Calculator transforms rejected           | Convert schema inputs structurally; preserve named arguments and input transforms; reject unsupported schemas explicitly                      |
+| `bindTools` options ignored and repeated bindings duplicated tools            | Preserve forced choice, strictness and parallel-call options; replace the previous tool list                                                  |
+| Every streamed tool call used index zero                                      | Assign distinct indices so LangChain aggregation preserves independent calls                                                                  |
+| Malformed arguments became `{}`; calls could escape failed streams            | Validate object arguments, names, IDs, advertised tools and terminal status before exposing tool calls                                        |
+| Replay records entered visible content and broke standard text output parsers | Keep opaque replay records in message metadata and restore them for subsequent model turns                                                    |
+| Structured output depended on incomplete SDK defaults                         | Support function calling, native JSON Schema, JSON mode, Zod parsing and `includeRaw`, including streaming                                    |
+| Legacy images, audio and tool-result media were lost                          | Normalize supported content before SDK conversion and send structured tool-result content                                                     |
+| Concurrent token refreshes could rotate twice or overwrite newer credentials  | Serialize state transactions; reuse tokens already refreshed by another execution; persist before deleting legacy credentials                 |
+| Error diagnostics automatically included prompt excerpts                      | Payload diagnostics are opt-in via `N8N_OPENAI_CODEX_DEBUG_PAYLOADS=true`                                                                     |
+| Loose model-name comparisons accepted unrelated variants                      | Accept exact model IDs and dated snapshots only                                                                                               |
+| Rate limits lacked bounded retry handling                                     | Honor `maxRetries` (0–5, default 2) for transient HTTP statuses before a successful stream; honor cancellation and bounded Retry-After delays |
 
 Regression coverage uses the actual installed n8n SDK, LangChain Calculator, DynamicStructuredTool, AgentExecutor, BufferMemory, prompt chains, text/structured output parsers and n8n tracing. Tests exercise public `invoke`, `stream`, repeated tool binding, structured output, memory/history replay, multiple calls, foreign Zod 3/4 copies, MCP-style schemas and media, cancellation, authentication races, and disk-write failures. HTTP/SSE responses are mocked. These are contract tests, not a claim that every n8n integration has been executed against a live account.
+
+Live credential testing on 2026-10-16 also passed n8n's real credential-dialog device bootstrap/Retry, transfer of the authorized test node's login into encrypted credentials, strict JSON inference in two separate workflows sharing that credential, and recovery after a deliberately invalid access token. n8n's native refresh persisted rotated access and refresh tokens; the legacy file retained only its nonsecret transfer marker. After a container restart, inference reused those persisted tokens without another refresh. Credential regression tests additionally cover concurrent use, delayed 401s, persistence failures, redaction, reconnect, and transfer cleanup races.
+
+The official n8n 2.43.5 image contains Node 26.7.0, AI SDK 0.33.3, AI utilities 0.36.3 and `n8n-workflow` 2.43.3. A separate upstream credential-dialog fix was verified in a temporary local image, then the official image was restored. Deployments use the official image and node-level **Test step** verification. The node does not require that credential-dialog fix.
 
 ## Capability boundaries
 
@@ -200,11 +220,13 @@ Regression coverage uses the actual installed n8n SDK, LangChain Calculator, Dyn
 - Arbitrary sampling settings, token limits and stop sequences are not supported by this Codex transport. Supplying them produces an explicit error.
 - Strict structured output requires a schema supported by the backend's strict mode. The node preserves optional arguments rather than silently making every property required. Zod output schemas also receive local parsing/validation; plain JSON Schema structured output also receives local validation.
 - The legacy reasoning-effort value `none` means no effort override, not disabled reasoning. Its UI label is now **No Effort Override**.
-- Authentication files are local to this n8n installation. Multi-process/shared-directory authentication needs cross-process coordination before it can be supported.
+- Legacy authentication files are local to one n8n process. Transfer the login to a Codex Account credential before enabling queue mode; sharing legacy files across workers is unsupported.
 - A full `pnpm build` is required for deployment. `build:watch`/plain TypeScript output alone is not a production artifact because the schema converters must be bundled.
 
-All **128 Docker regression/integration tests passed** with no skipped tests. This suite checks actual n8n Agent/Chain/parser implementations, including automatic formatter detection, final JSON text, forced tools, conflicting schemas, strict validation and login recovery. Run it with `pnpm test:docker`. On the Node 24 host, **123 tests passed**; five cases requiring the full installed n8n runtime and two opt-in live cases were skipped. The container uses Node 26.10.0, `@n8n/ai-node-sdk` 0.34.1, `@n8n/ai-utilities` 0.37.1, `n8n-workflow` 2.44.1, and Zod 3.25.76. Registration includes node versions 1, 2 and 3.
+All **167 Docker regression/integration tests passed** on the stock n8n 2.43.5 and 2.44.1 images, with no skipped tests. This suite checks actual n8n Agent/Chain/parser implementations, including automatic formatter detection, final JSON text, forced tools, conflicting schemas, strict validation and login recovery. Run it with `pnpm test:docker`. On the Node 24 host, **156 tests passed**; eleven cases requiring the full installed n8n runtime and two opt-in live cases were skipped. The 2.44.1 container uses Node 26.10.0, `@n8n/ai-node-sdk` 0.34.1, `@n8n/ai-utilities` 0.37.1, `n8n-workflow` 2.44.1, and Zod 3.25.76. Registration includes node versions 1, 2, 3 and 4. Device-code polling and PKCE exchange are covered in regular and queue modes.
+
+The queue suite passed on both official images with a main instance, two workers, PostgreSQL 17 and Redis. Eight executions with valid tokens caused no refresh. Eight concurrent executions with expired tokens caused one exchange. 401 recovery and token reuse after worker restart also passed. An opaque access-token case caused two serial refresh attempts with one successful rotation. A 12.5-second refresh reproduced n8n's ten-second timeout fallback: two overlapping attempts, one successful rotation, and recovery using the persisted tokens. These tests use a synthetic issuer and model backend; they do not claim that every issuer failure can recover without reconnecting.
 
 Live account tests separately exercise strict JSON through the installed Basic LLM Chain and an Agent that calls a read-only tool with named string, integer and boolean arguments before returning its parsed result. Live testing on 2026-10-15 passed both cases with GPT-6.1 Sol and GPT-5.6 Sol. The account catalog currently advertises Responses Lite models; standard Responses remains covered by mocked contract tests rather than live inference.
 
-To rerun live tests in an n8n container, place `tests/live-output.test.cjs` beside the compiled `dist` directory and set `NODE_PATH=/usr/local/lib/node_modules/n8n/node_modules`, `CODEX_TEST_LIVE=true`, `CODEX_LIVE_WORKFLOW_ID`, `CODEX_LIVE_NODE_ID`, and `N8N_OPENAI_CODEX_STATE_DIR` to the existing authenticated node's values. Run `node --test --test-concurrency=1 tests/live-output.test.cjs`. `CODEX_LIVE_MODELS` accepts a comma-separated list of model IDs; its default is `gpt-6.1-sol`. Tests make real model calls, use synthetic test data, and save refreshed tokens to the original login file. Run these while that workflow is idle; shared login state across concurrent n8n processes is unsupported.
+To rerun the legacy-file live tests in an n8n container, place `tests/live-output.test.cjs` beside the compiled `dist` directory and set `NODE_PATH=/usr/local/lib/node_modules/n8n/node_modules`, `CODEX_TEST_LIVE=true`, `CODEX_LIVE_WORKFLOW_ID`, `CODEX_LIVE_NODE_ID`, and `N8N_OPENAI_CODEX_STATE_DIR` to the existing authenticated node's values. Run `node --test --test-concurrency=1 tests/live-output.test.cjs`. `CODEX_LIVE_MODELS` accepts a comma-separated list of model IDs; its default is `gpt-6.1-sol`. Tests make real model calls, use synthetic test data, and save refreshed tokens to the original login file. Run these while that workflow is idle; shared login state across concurrent n8n processes is unsupported.

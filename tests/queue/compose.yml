@@ -1,0 +1,97 @@
+x-n8n: &n8n
+  image: ${N8N_IMAGE:-docker.n8n.io/n8nio/n8n:2.43.5}
+  environment:
+    EXECUTIONS_MODE: queue
+    DB_TYPE: postgresdb
+    DB_POSTGRESDB_HOST: postgres
+    DB_POSTGRESDB_DATABASE: codex_test
+    DB_POSTGRESDB_USER: codex_test
+    DB_POSTGRESDB_PASSWORD: test-only-password
+    QUEUE_BULL_REDIS_HOST: redis
+    QUEUE_HEALTH_CHECK_ACTIVE: 'true'
+    N8N_ENCRYPTION_KEY: codex-queue-regression-test-only-key
+    N8N_CUSTOM_EXTENSIONS: /opt/codex-dist
+    N8N_UNVERIFIED_PACKAGES_ENABLED: 'true'
+    N8N_SECURE_COOKIE: 'false'
+    N8N_DIAGNOSTICS_ENABLED: 'false'
+    N8N_PERSONALIZATION_ENABLED: 'false'
+    N8N_VERSION_NOTIFICATIONS_ENABLED: 'false'
+    N8N_LOG_LEVEL: debug
+    NODE_EXTRA_CA_CERTS: /fixtures/cert.pem
+    # The private network resolves only these hosts to the synthetic issuer.
+    N8N_SSRF_PROTECTION_ENABLED: 'true'
+    N8N_SSRF_ALLOWED_HOSTNAMES: auth.openai.com,chatgpt.com
+  volumes:
+    - ../../dist:/opt/codex-dist:ro
+    - ${CODEX_QUEUE_FIXTURES:?Test runner must set CODEX_QUEUE_FIXTURES}:/fixtures:ro
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+    issuer: { condition: service_started }
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: codex_test
+      POSTGRES_USER: codex_test
+      POSTGRES_PASSWORD: test-only-password
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U codex_test -d codex_test']
+      interval: 1s
+      timeout: 3s
+      retries: 60
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+  issuer:
+    image: ${N8N_IMAGE:-docker.n8n.io/n8nio/n8n:2.43.5}
+    entrypoint: node
+    user: '0'
+    command: [/tests/issuer.cjs]
+    volumes:
+      - ./issuer.cjs:/tests/issuer.cjs:ro
+      - ${CODEX_QUEUE_FIXTURES}:/fixtures:ro
+      - ../../dist:/opt/codex-dist:ro
+    ports: ['127.0.0.1::8080']
+    networks:
+      default:
+        aliases: [auth.openai.com, chatgpt.com]
+      control: {}
+  main:
+    <<: *n8n
+    command: start
+    ports: ['127.0.0.1::5678']
+    networks: [default, control]
+    healthcheck:
+      test: [CMD, wget, --spider, -q, 'http://127.0.0.1:5678/healthz/readiness']
+      interval: 2s
+      timeout: 3s
+      retries: 90
+      start_period: 10s
+  worker-a:
+    <<: *n8n
+    command: [worker, --concurrency=1]
+    healthcheck: &worker-health
+      test: [CMD, wget, --spider, -q, 'http://127.0.0.1:5678/healthz/readiness']
+      interval: 2s
+      timeout: 3s
+      retries: 90
+      start_period: 5s
+    depends_on:
+      main: { condition: service_healthy }
+  worker-b:
+    <<: *n8n
+    command: [worker, --concurrency=1]
+    healthcheck: *worker-health
+    depends_on:
+      main: { condition: service_healthy }
+
+networks:
+  default:
+    internal: true
+  control: {}

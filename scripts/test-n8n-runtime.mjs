@@ -30,6 +30,8 @@ const result = spawnSync(
 		process.env.N8N_IMAGE || 'ghcr.io/n8n-io/n8n:2.44.1',
 		'--test',
 		'/opt/codex-test/tests/compatibility.test.cjs',
+		'/opt/codex-test/tests/credentials.test.cjs',
+		'/opt/codex-test/tests/credentials-runtime.test.cjs',
 		'/opt/codex-test/tests/n8n-runtime.test.cjs',
 	],
 	{ stdio: 'inherit' },
